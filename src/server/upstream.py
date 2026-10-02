@@ -84,5 +84,48 @@ class UpstreamClient:
 
             return resp, current_alias
 
+    async def forward_stream(self, alias: str, payload: dict[str, Any]) -> tuple[Any, str, dict[str, str]]:
+        current_alias = alias
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        url = f"{self.base_url}/chat/completions"
+
+        while True:
+            outbound_payload = self.prepare_payload(current_alias, payload)
+            logger.info("Forwarding stream to %s (alias: %s)", outbound_payload["model"], current_alias)
+
+            stream_cm = self.client.stream("POST", url, json=outbound_payload, headers=headers)
+            try:
+                resp = await stream_cm.__aenter__()
+            except Exception as e:
+                logger.warning("Upstream stream initiation failed on alias %s: %s", current_alias, e)
+                if current_alias in self.fallback_chain:
+                    next_alias = self.fallback_chain[current_alias]
+                    current_alias = next_alias
+                    continue
+                raise
+
+            if resp.status_code in (429, 502, 503, 504):
+                await stream_cm.__aexit__(None, None, None)
+                if current_alias in self.fallback_chain:
+                    next_alias = self.fallback_chain[current_alias]
+                    logger.warning(
+                        "Upstream stream returned %d for %s. Falling back to %s",
+                        resp.status_code, current_alias, next_alias
+                    )
+                    current_alias = next_alias
+                    continue
+
+            async def chunk_generator():
+                try:
+                    async for chunk in resp.aiter_bytes():
+                        yield chunk
+                finally:
+                    await stream_cm.__aexit__(None, None, None)
+
+            return chunk_generator(), current_alias, dict(resp.headers)
+
     async def close(self) -> None:
         await self.client.aclose()

@@ -73,9 +73,9 @@ class CircuitBreakerTracker:
     def record_failure(
         self,
         subtask_id: str,
-        traceback_text: str,
-        diff_text: str,
-        current_tier: str
+        traceback_text: str | None = None,
+        diff_text: str | None = None,
+        current_tier: str = "flash"
     ) -> BreakerDecision:
         state = self._get_or_create_state(subtask_id)
         state.iterations += 1
@@ -87,7 +87,7 @@ class CircuitBreakerTracker:
                 summary = (
                     f"HANDOFF MANUSIA: Subtask '{subtask_id}' gagal 2x berturut-turut pada Tier Opus.\n"
                     f"Total iterasi: {state.iterations}.\n"
-                    f"Traceback terakhir:\n{traceback_text[-500:]}"
+                    f"Traceback terakhir:\n{(traceback_text or '')[-500:]}"
                 )
                 return BreakerDecision(
                     action="human_handoff",
@@ -115,48 +115,50 @@ class CircuitBreakerTracker:
             )
 
         # 4. Empty diff guard check
-        clean_diff = diff_text.strip()
-        if not clean_diff:
-            state.consecutive_empty_diffs += 1
-            if state.consecutive_empty_diffs >= self.empty_diff_limit:
-                return BreakerDecision(
-                    action="rollback_last_clean_commit_then_escalate_one_tier",
-                    reason="consecutive_empty_diffs_3x",
-                    opus_attempts=state.opus_attempts
-                )
-        else:
-            state.consecutive_empty_diffs = 0
-
-            # 5. Diff oscillation check
-            diff_hash = hashlib.sha256(clean_diff.encode("utf-8")).hexdigest()[:16]
-            state.diff_hash_history.append(diff_hash)
-            if len(state.diff_hash_history) > self.oscillation_window:
-                state.diff_hash_history.pop(0)
-
-            # Check for oscillation pattern (e.g., A -> B -> A within window)
-            if len(state.diff_hash_history) >= 3:
-                h = state.diff_hash_history
-                if h[-1] == h[-3] and h[-1] != h[-2]:
+        if diff_text is not None:
+            clean_diff = diff_text.strip()
+            if not clean_diff:
+                state.consecutive_empty_diffs += 1
+                if state.consecutive_empty_diffs >= self.empty_diff_limit:
                     return BreakerDecision(
-                        action="force_escalate_one_tier",
-                        reason="diff_oscillation_detected",
+                        action="rollback_last_clean_commit_then_escalate_one_tier",
+                        reason="consecutive_empty_diffs_3x",
                         opus_attempts=state.opus_attempts
                     )
+            else:
+                state.consecutive_empty_diffs = 0
+
+                # 5. Diff oscillation check
+                diff_hash = hashlib.sha256(clean_diff.encode("utf-8")).hexdigest()[:16]
+                state.diff_hash_history.append(diff_hash)
+                if len(state.diff_hash_history) > self.oscillation_window:
+                    state.diff_hash_history.pop(0)
+
+                # Check for oscillation pattern (e.g., A -> B -> A within window)
+                if len(state.diff_hash_history) >= 3:
+                    h = state.diff_hash_history
+                    if h[-1] == h[-3] and h[-1] != h[-2]:
+                        return BreakerDecision(
+                            action="force_escalate_one_tier",
+                            reason="diff_oscillation_detected",
+                            opus_attempts=state.opus_attempts
+                        )
 
         # 6. Identical error loop breaker (normalized traceback)
-        sig = normalize_traceback(traceback_text)
-        if state.last_normalized_traceback == sig:
-            state.consecutive_identical_tracebacks += 1
-        else:
-            state.last_normalized_traceback = sig
-            state.consecutive_identical_tracebacks = 1
+        if traceback_text:
+            sig = normalize_traceback(traceback_text)
+            if state.last_normalized_traceback == sig:
+                state.consecutive_identical_tracebacks += 1
+            else:
+                state.last_normalized_traceback = sig
+                state.consecutive_identical_tracebacks = 1
 
-        if state.consecutive_identical_tracebacks >= self.identical_traceback_limit:
-            return BreakerDecision(
-                action="force_escalate_one_tier",
-                reason="identical_error_loop_3x",
-                opus_attempts=state.opus_attempts
-            )
+            if state.consecutive_identical_tracebacks >= self.identical_traceback_limit:
+                return BreakerDecision(
+                    action="force_escalate_one_tier",
+                    reason="identical_error_loop_3x",
+                    opus_attempts=state.opus_attempts
+                )
 
         return BreakerDecision(
             action="continue",

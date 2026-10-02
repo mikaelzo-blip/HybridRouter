@@ -93,3 +93,40 @@ async def test_chat_completions_forwarding_and_fallback(app):
             assert data["choices"][0]["message"]["content"] == "Sonnet response"
             # Verify fallback was invoked
             assert mock_post.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_auto_routing_without_metadata_routes_to_tactical_on_service_mention(app):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Standard OpenAI client format (no metadata dict)
+        payload = {
+            "model": "auto",
+            "messages": [
+                {"role": "user", "content": "Tolong perbaiki bug pada src/services/payment.py"}
+            ]
+        }
+        resp = await client.post("/debug/route", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["matched_rule"] == "backend_core"
+        assert data["target_alias"] == "gemini_tactical"
+
+
+@pytest.mark.asyncio
+async def test_auto_routing_without_metadata_routes_to_opus_on_architecture_prompt(app):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Standard OpenAI client format (no metadata dict)
+        payload = {
+            "model": "auto",
+            "messages": [
+                {"role": "user", "content": "Rancang system_architecture baru dan buat schema.prisma"}
+            ]
+        }
+        resp = await client.post("/debug/route", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["matched_rule"] == "apex_design"
+        assert data["target_alias"] == "opus_apex"
+

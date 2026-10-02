@@ -110,11 +110,16 @@ class FullRouterConfigFile(BaseModel):
 
 
 class RequestMetadata(BaseModel):
+    model_config = {"extra": "allow"}
+
     turn: int = 1
     retry_count: int = 0
     files_target: list[str] = Field(default_factory=list)
     intent: list[str] = Field(default_factory=list)
     subtask_id: str | None = None
+    session_id: str | None = None
+    last_traceback: str | None = None
+    last_diff: str | None = None
 
 
 class RouteDecision(BaseModel):

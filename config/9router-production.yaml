@@ -118,6 +118,30 @@ router:
         )
       target: opus_apex
 
+    - name: agent_design_reasoning
+      priority: 76
+      condition: >
+        has_intent(["agent_activity_design", "agent_activity_tdd"])
+      target: gemini_tactical
+
+    - name: agent_debugging
+      priority: 78
+      condition: >
+        has_intent(["agent_activity_debugging"])
+      target: gemini_tactical
+
+    - name: agent_code_review
+      priority: 74
+      condition: >
+        has_intent(["agent_activity_code_review"])
+      target: gemini_tactical
+
+    - name: agent_delegation
+      priority: 72
+      condition: >
+        has_intent(["agent_activity_delegation"])
+      target: gemini_tactical
+
     - name: backend_core
       priority: 70
       condition: >
