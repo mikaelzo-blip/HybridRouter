@@ -2,9 +2,12 @@ import os
 import re
 from typing import Any
 import yaml
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
 from src.schemas import FullRouterConfigFile
+
+load_dotenv()
 
 PLACEHOLDER_REGEX = re.compile(r"\$\{([A-Za-z0-9_]+)\}")
 
