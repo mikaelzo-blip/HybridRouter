@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+import json
 import logging
 from typing import Any
 from fastapi import FastAPI, Request, HTTPException
@@ -10,6 +11,7 @@ from src.schemas import RequestMetadata
 from src.server.upstream import UpstreamClient
 from src.breakers.circuit import CircuitBreakerTracker
 from src.guard.test_integrity import TestIntegrityGuard, is_test_file
+from src.observability.spend import TokenSpendTracker
 
 logger = logging.getLogger("hybrid_router")
 
@@ -39,6 +41,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app.state.router_engine = router_engine
     app.state.circuit_tracker = CircuitBreakerTracker()
     app.state.test_guard = TestIntegrityGuard()
+    app.state.spend_tracker = TokenSpendTracker()
 
     @app.get("/health")
     async def health():
@@ -109,6 +112,17 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             "session_id": session_id,
         }
 
+    @app.get("/observability/spend")
+    async def observability_spend(subtask_id: str | None = None):
+        spend_tracker: TokenSpendTracker = app.state.spend_tracker
+        if subtask_id:
+            spend = spend_tracker.get_subtask_spend(subtask_id)
+            is_anomaly, reason = spend_tracker.check_anomaly(subtask_id)
+            spend["is_anomaly"] = is_anomaly
+            spend["anomaly_reason"] = reason
+            return spend
+        return spend_tracker.get_daily_summary()
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         body = await request.json()
@@ -118,10 +132,12 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         meta_dict = body.get("metadata", {})
 
         target_alias = model_requested
+        rule_name = "direct_request"
 
         if model_requested == "auto":
             decision = router_engine.route(ctx)
             target_alias = decision.target_model
+            rule_name = decision.rule_name
             # Note: transforms can be applied to messages in body if needed
             logger.info("Routing decision: %s -> %s", decision.rule_name, target_alias)
 
@@ -159,10 +175,16 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if is_stream:
             try:
                 stream_gen, final_alias, headers = await upstream.forward_stream(target_alias, body)
+                resp_headers = {
+                    "Content-Type": headers.get("content-type", "text/event-stream"),
+                    "x-routed-model": target_alias,
+                    "x-routed-final-alias": final_alias,
+                    "x-routed-rule": rule_name,
+                }
                 return StreamingResponse(
                     stream_gen,
                     status_code=200,
-                    headers={"Content-Type": headers.get("content-type", "text/event-stream")}
+                    headers=resp_headers
                 )
             except Exception as e:
                 logger.error("Upstream stream error on alias %s: %s", target_alias, e)
@@ -174,10 +196,35 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             logger.error("Upstream error on alias %s: %s", target_alias, e)
             raise HTTPException(status_code=502, detail=f"Upstream provider failure: {str(e)}")
 
+        resp_headers = {
+            "Content-Type": resp.headers.get("content-type", "application/json"),
+            "x-routed-model": target_alias,
+            "x-routed-final-alias": final_alias,
+            "x-routed-rule": rule_name,
+        }
+
+        # Observability & token spend anomaly tracking
+        subtask_id = metadata.subtask_id or metadata.session_id or "default"
+        try:
+            resp_data = json.loads(resp.content)
+            usage = resp_data.get("usage", {})
+            prompt_tokens = usage.get("prompt_tokens", 0)
+            completion_tokens = usage.get("completion_tokens", 0)
+            if prompt_tokens or completion_tokens:
+                app.state.spend_tracker.record_usage(
+                    subtask_id, prompt_tokens, completion_tokens, target_alias
+                )
+                is_anomaly, reason = app.state.spend_tracker.check_anomaly(subtask_id)
+                if is_anomaly:
+                    resp_headers["x-spend-anomaly"] = "true"
+                    resp_headers["x-spend-anomaly-reason"] = reason
+        except Exception:
+            pass
+
         return Response(
             content=resp.content,
             status_code=resp.status_code,
-            headers={"Content-Type": resp.headers.get("content-type", "application/json")}
+            headers=resp_headers
         )
 
     return app

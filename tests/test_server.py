@@ -89,6 +89,9 @@ async def test_chat_completions_forwarding_and_fallback(app):
             }
             resp = await client.post("/v1/chat/completions", json=payload)
             assert resp.status_code == 200
+            assert resp.headers["x-routed-model"] == "opus_apex"
+            assert resp.headers["x-routed-final-alias"] == "sonnet_fallback"
+            assert resp.headers["x-routed-rule"] == "rescue_opus"
             data = resp.json()
             assert data["choices"][0]["message"]["content"] == "Sonnet response"
             # Verify fallback was invoked
@@ -129,4 +132,66 @@ async def test_auto_routing_without_metadata_routes_to_opus_on_architecture_prom
         data = resp.json()
         assert data["matched_rule"] == "apex_design"
         assert data["target_alias"] == "opus_apex"
+
+
+@pytest.mark.asyncio
+async def test_spend_observability_endpoint(app):
+    transport = ASGITransport(app=app)
+    mock_resp = Response(
+        status_code=200,
+        json={
+            "id": "chatcmpl-spend",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "Done"}}],
+            "usage": {"prompt_tokens": 120, "completion_tokens": 40}
+        }
+    )
+    with patch.object(app.state.upstream.client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "model": "gemini_executor",
+                "messages": [{"role": "user", "content": "Hi"}],
+                "metadata": {"subtask_id": "test-subtask-1"}
+            }
+            await client.post("/v1/chat/completions", json=payload)
+
+            # Query spend endpoint
+            resp = await client.get("/observability/spend", params={"subtask_id": "test-subtask-1"})
+            assert resp.status_code == 200
+            data = resp.json()
+            assert data["subtask_id"] == "test-subtask-1"
+            assert data["total_tokens"] == 160
+            assert data["prompt_tokens"] == 120
+            assert data["completion_tokens"] == 40
+            assert data["is_anomaly"] is False
+
+
+@pytest.mark.asyncio
+async def test_spend_anomaly_header_alert(app):
+    transport = ASGITransport(app=app)
+    # Set high spend on mock response
+    mock_resp = Response(
+        status_code=200,
+        json={
+            "id": "chatcmpl-anomaly",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "Done"}}],
+            "usage": {"prompt_tokens": 80000, "completion_tokens": 10000}
+        }
+    )
+    with patch.object(app.state.upstream.client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "model": "opus_apex",
+                "messages": [{"role": "user", "content": "Large task"}],
+                "metadata": {"subtask_id": "subtask-large"}
+            }
+            resp = await client.post("/v1/chat/completions", json=payload)
+            assert resp.status_code == 200
+            assert resp.headers.get("x-spend-anomaly") == "true"
+            assert "subtask-large" in resp.headers.get("x-spend-anomaly-reason", "")
+
+
 

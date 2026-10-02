@@ -54,9 +54,11 @@ class UpstreamClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self.base_url}/chat/completions"
+        req_payload = copy.deepcopy(payload)
+        req_payload["stream"] = False
 
         while True:
-            outbound_payload = self.prepare_payload(current_alias, payload)
+            outbound_payload = self.prepare_payload(current_alias, req_payload)
             logger.info("Forwarding request to %s (alias: %s)", outbound_payload["model"], current_alias)
 
             try:
@@ -91,9 +93,11 @@ class UpstreamClient:
             headers["Authorization"] = f"Bearer {self.api_key}"
 
         url = f"{self.base_url}/chat/completions"
+        req_payload = copy.deepcopy(payload)
+        req_payload["stream"] = True
 
         while True:
-            outbound_payload = self.prepare_payload(current_alias, payload)
+            outbound_payload = self.prepare_payload(current_alias, req_payload)
             logger.info("Forwarding stream to %s (alias: %s)", outbound_payload["model"], current_alias)
 
             stream_cm = self.client.stream("POST", url, json=outbound_payload, headers=headers)
