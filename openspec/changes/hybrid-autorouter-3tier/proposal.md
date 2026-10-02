@@ -27,4 +27,4 @@ Coding agent workflows require a robust multi-model routing tier to maximize spe
 ## Impact
 - New Python 3.14+ codebase under `src/` using Pydantic v2, FastAPI, and Pytest.
 - Integration with local 9Router service on port 20128.
-- Agent harness and local tooling can target `http://127.0.0.1:20200/v1` as an OpenAI-compatible gateway.
+- Agent harness and local tooling can target `http://127.0.0.1:20250/v1` as an OpenAI-compatible gateway (distinct from legacy auto-router on port 20200).

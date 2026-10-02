@@ -73,7 +73,7 @@ Coding agents need to route LLM queries across different tiers according to task
 1. Initialize project with `pyproject.toml` and dependencies (`fastapi`, `uvicorn`, `pydantic-settings`, `httpx`, `pyyaml`).
 2. Implement components in modular stages via strict TDD (tests first).
 3. Verify `/v1/models` and `/debug/route` against simulated and live 9Router payloads.
-4. Point coding agents to `http://127.0.0.1:20200/v1` as the virtual OpenAI provider.
+- Point coding agents to `http://127.0.0.1:20250/v1` as the virtual OpenAI provider (distinct from legacy auto-router on port 20200).
 
 ## Open Questions
 
