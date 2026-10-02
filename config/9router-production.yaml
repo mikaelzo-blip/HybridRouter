@@ -1,0 +1,156 @@
+version: "2026.1"
+
+providers:
+  antigravity:
+    base_url: "${ANTIGRAVITY_BASE_URL}"
+    api_key: "${ANTIGRAVITY_API_KEY}"
+
+models:
+  opus_apex:
+    provider: antigravity
+    model: "${OPUS_4_6_MODEL_ID}"
+    concurrency_limit: 5
+    rpm_limit: "${OPUS_RPM}"
+    tpm_limit: "${OPUS_TPM}"
+    timeout_seconds: 180
+    parameters:
+      max_tokens: 48000
+      thinking:
+        type: enabled
+        budget_tokens: 32768
+      # temperature sengaja tidak diset
+
+  sonnet_fallback:
+    provider: antigravity
+    model: "${SONNET_4_6_MODEL_ID}"
+    concurrency_limit: 10
+    timeout_seconds: 90
+
+  gemini_tactical:
+    provider: antigravity
+    model: "${GEMINI_3_1_PRO_MODEL_ID}"
+    concurrency_limit: 30
+    rpm_limit: "${PRO_RPM}"
+    tpm_limit: "${PRO_TPM}"
+    timeout_seconds: 60
+    parameters:
+      temperature: 0.1
+      thinking:
+        type: enabled
+        budget_tokens: 8192
+
+  gemini_executor:
+    provider: antigravity
+    model: "${GEMINI_3_8_FLASH_MODEL_ID}"
+    concurrency_limit: 100
+    rpm_limit: "${FLASH_RPM}"
+    tpm_limit: "${FLASH_TPM}"
+    timeout_seconds: 30
+    parameters:
+      temperature: 0.0
+      thinking:
+        type: enabled
+        budget_tokens: 2048
+
+resilience:
+  on_429:
+    strategy: exponential_backoff_with_jitter
+    max_attempts: 5
+  fallback_chain:
+    opus_apex: sonnet_fallback
+    gemini_tactical: sonnet_fallback
+    gemini_executor: gemini_tactical
+
+router:
+  routing_strategy: rule_based
+  rules:
+    - name: rescue_opus
+      priority: 100
+      condition: "context.metadata.retry_count >= 4"
+      target: opus_apex
+      max_attempts_per_subtask: 2
+      context_transforms:
+        - action: strip_terminal_noise
+          keep_last_lines: 40
+        - action: inject_system_prompt
+          content: "Modul buntu di tier bawah. Audit arsitektural file yang bersengketa; jangan menambal gejala."
+
+    - name: l1_pro_patch
+      priority: 95
+      condition: "context.metadata.retry_count == 3"
+      target: gemini_tactical
+      context_transforms:
+        - action: strip_terminal_noise
+          keep_last_lines: 60
+
+    - name: ingest_then_design
+      priority: 90
+      condition: >
+        context.metadata.turn == 1 and request.total_tokens > 40000 and (
+          matches_any(files.target, ["*.prisma", "*.sql", "openapi.*", "docker-compose.yml", "schema.ts"]) or
+          has_intent(["system_architecture", "database_migration", "concurrency_design", "auth_protocol"])
+        )
+      pipeline:
+        - target: gemini_tactical
+          task: distill
+          thinking:
+            budget_tokens: 4096
+        - target: opus_apex
+          task: design
+
+    - name: ingest_only
+      priority: 85
+      condition: "context.metadata.turn == 1 and request.total_tokens > 40000"
+      pipeline:
+        - target: gemini_tactical
+          task: distill
+          thinking:
+            budget_tokens: 4096
+        - target: gemini_tactical
+          task: plan
+
+    - name: apex_design
+      priority: 80
+      condition: >
+        context.metadata.turn == 1 and (
+          matches_any(files.target, ["*.prisma", "*.sql", "openapi.*", "docker-compose.yml", "schema.ts"]) or
+          has_intent(["system_architecture", "database_migration", "concurrency_design", "auth_protocol"])
+        )
+      target: opus_apex
+
+    - name: backend_core
+      priority: 70
+      condition: >
+        matches_any(files.target, ["src/services/**", "src/controllers/**", "src/api/**", "src/lib/auth/**"])
+      target: gemini_tactical
+
+    - name: default_worker
+      priority: 10
+      condition: default
+      target: gemini_executor
+
+circuit_breakers:
+  identical_error_loop:
+    signature: normalized_traceback
+    consecutive: 3
+    action: force_escalate_one_tier
+
+  diff_oscillation:
+    window: 6
+    action: force_escalate_one_tier
+
+  empty_diff_guard:
+    consecutive_empty_diffs: 3
+    action: rollback_last_clean_commit_then_escalate_one_tier
+
+  subtask_limits:
+    max_iterations: 12
+    max_wall_clock_minutes: 30
+    action: force_escalate_one_tier
+
+  opus_exhausted:
+    max_attempts: 2
+    action: human_handoff
+
+  test_tampering:
+    action: reject_patch_and_escalate
