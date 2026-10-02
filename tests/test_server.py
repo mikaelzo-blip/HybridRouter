@@ -78,11 +78,8 @@ async def test_chat_completions_forwarding_and_fallback(app):
         }
     )
     
-    with patch("src.server.upstream.UpstreamClient.forward_request", new_callable=AsyncMock) as mock_forward:
-        mock_forward.side_effect = [
-            (mock_resp_429, "opus_apex"),
-            (mock_resp_200, "sonnet_fallback")
-        ]
+    with patch.object(app.state.upstream.client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.side_effect = [mock_resp_429, mock_resp_200]
         
         async with AsyncClient(transport=transport, base_url="http://test") as client:
             payload = {
@@ -95,4 +92,4 @@ async def test_chat_completions_forwarding_and_fallback(app):
             data = resp.json()
             assert data["choices"][0]["message"]["content"] == "Sonnet response"
             # Verify fallback was invoked
-            assert mock_forward.call_count == 2
+            assert mock_post.call_count == 2
