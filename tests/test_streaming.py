@@ -155,3 +155,70 @@ def test_server_streaming_endpoint(mock_config):
         assert response.status_code == 200
         assert "text/event-stream" in response.headers.get("content-type", "")
         assert b"".join(chunks) in response.content
+
+
+@pytest.mark.asyncio
+async def test_forward_stream_mid_stream_disconnect(mock_config):
+    """Generator harus yield SSE error event jika stream putus mid-flight."""
+    upstream = UpstreamClient(mock_config)
+
+    async def mock_aiter_bytes_broken():
+        yield b'data: {"choices": [{"delta": {"content": "Hello"}}]}\n\n'
+        raise httpx.StreamClosed()
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {"content-type": "text/event-stream"}
+    mock_resp.aiter_bytes = mock_aiter_bytes_broken
+
+    class MockStreamContext:
+        async def __aenter__(self): return mock_resp
+        async def __aexit__(self, *a): pass
+
+    with patch.object(upstream.client, "stream", return_value=MockStreamContext()):
+        gen, _, _ = await upstream.forward_stream(
+            "gemini_executor",
+            {"model": "auto", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+        collected = []
+        async for chunk in gen:
+            collected.append(chunk)
+
+    body = b"".join(collected)
+    assert b"Hello" in body                     # chunk pertama sampai
+    assert b"upstream_stream_error" in body     # SSE error event dikirim
+    await upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_forward_stream_double_close_safe(mock_config):
+    """__aexit__ dipanggil dua kali tidak boleh raise."""
+    upstream = UpstreamClient(mock_config)
+    aexit_count = []
+
+    async def mock_aiter_bytes_broken():
+        raise httpx.StreamClosed()
+        yield  # make it a generator
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {}
+    mock_resp.aiter_bytes = mock_aiter_bytes_broken
+
+    class MockStreamContextDoubleClose:
+        async def __aenter__(self): return mock_resp
+        async def __aexit__(self, *a):
+            aexit_count.append(1)
+            if len(aexit_count) > 1:
+                raise RuntimeError("double close!")
+
+    with patch.object(upstream.client, "stream", return_value=MockStreamContextDoubleClose()):
+        gen, _, _ = await upstream.forward_stream(
+            "gemini_executor",
+            {"model": "auto", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+        collected = []
+        async for chunk in gen:
+            collected.append(chunk)
+    # Tidak boleh raise RuntimeError
+    await upstream.close()

@@ -1,4 +1,5 @@
 import copy
+import json
 import logging
 from typing import Any
 import httpx
@@ -126,8 +127,20 @@ class UpstreamClient:
                 try:
                     async for chunk in resp.aiter_bytes():
                         yield chunk
+                except (httpx.StreamClosed, httpx.RemoteProtocolError, httpx.ReadTimeout, httpx.ReadError) as exc:
+                    logger.warning(
+                        "Upstream stream disconnected mid-flight (alias=%s): %s",
+                        current_alias, exc,
+                    )
+                    error_payload = json.dumps({
+                        "error": {"type": "upstream_stream_error", "message": str(exc)}
+                    })
+                    yield f"data: {error_payload}\n\n".encode()
                 finally:
-                    await stream_cm.__aexit__(None, None, None)
+                    try:
+                        await stream_cm.__aexit__(None, None, None)
+                    except Exception:
+                        pass
 
             return chunk_generator(), current_alias, dict(resp.headers)
 
