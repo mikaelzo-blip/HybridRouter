@@ -130,18 +130,39 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         ctx = extract_routing_context(body)
         metadata = ctx.metadata
         meta_dict = body.get("metadata", {})
+        session_id = meta_dict.get("session_id") or metadata.session_id or metadata.subtask_id or "default"
+        state = app.state.circuit_tracker._get_or_create_state(session_id)
+        metadata.opus_attempts = max(metadata.opus_attempts, state.opus_attempts)
 
         target_alias = model_requested
         rule_name = "direct_request"
 
-        if model_requested == "auto":
+        # Build reverse lookup: upstream model ID → alias (e.g. "ag/claude-sonnet-4-6" → "sonnet_fallback")
+        model_id_to_alias: dict[str, str] = {
+            mcfg.model: alias
+            for alias, mcfg in config.models.items()
+            if mcfg.model
+        }
+
+        # Normalize: if client sent a raw upstream model ID, remap to known alias
+        normalized = model_id_to_alias.get(model_requested)
+        if normalized:
+            logger.info("Normalized model ID %s → alias %s", model_requested, normalized)
+            model_requested = normalized
+
+        # Route: "auto", after normalization from raw model ID, or completely unknown model
+        should_route = (model_requested == "auto") or bool(normalized) or (model_requested not in config.models)
+        if should_route:
             decision = router_engine.route(ctx)
             target_alias = decision.target_model
             rule_name = decision.rule_name
-            # Note: transforms can be applied to messages in body if needed
             logger.info("Routing decision: %s -> %s", decision.rule_name, target_alias)
+        else:
+            # Known alias passed directly — respect it
+            target_alias = model_requested
 
-        session_id = meta_dict.get("session_id") or metadata.session_id or metadata.subtask_id or "default"
+        if target_alias in ("opus_apex", "opus"):
+            state.opus_attempts += 1
         tb = meta_dict.get("last_traceback") or metadata.last_traceback
         diff = meta_dict.get("last_diff") if "last_diff" in meta_dict else metadata.last_diff
 
@@ -164,11 +185,20 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         if target_alias in ("gemini_executor", "flash"):
             for f in metadata.files_target:
                 if is_test_file(f):
-                    logger.warning("Tier 3 attempt to modify test file rejected: %s", f)
-                    raise HTTPException(
-                        status_code=403,
-                        detail=f"Tier 3 ({target_alias}) is prohibited from modifying test files. Escalation required."
-                    )
+                    if model_requested == "auto":
+                        old_target = target_alias
+                        target_alias = TIER_ESCALATION.get(target_alias, "gemini_tactical")
+                        logger.warning(
+                            "Tier 3 auto-routed request touches test file %s. Auto-escalating %s -> %s as per test integrity policy.",
+                            f, old_target, target_alias
+                        )
+                        break
+                    else:
+                        logger.warning("Tier 3 attempt to modify test file rejected: %s", f)
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Tier 3 ({target_alias}) is prohibited from modifying test files. Escalation required."
+                        )
 
         is_stream = bool(body.get("stream", False))
 

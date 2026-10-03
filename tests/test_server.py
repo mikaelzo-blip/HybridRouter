@@ -135,6 +135,65 @@ async def test_auto_routing_without_metadata_routes_to_opus_on_architecture_prom
 
 
 @pytest.mark.asyncio
+async def test_explicit_model_id_gets_normalized_and_routed(app):
+    """Client yang hardcode model ID asli (ag/claude-sonnet-4-6) harus
+    di-normalize ke alias lalu masuk routing engine di /v1/chat/completions."""
+    transport = ASGITransport(app=app)
+    mock_resp = Response(
+        status_code=200,
+        json={
+            "id": "chatcmpl-norm",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        }
+    )
+    with patch.object(app.state.upstream.client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "model": "ag/claude-sonnet-4-6",   # model ID asli, bukan alias
+                "messages": [{"role": "user", "content": "Tolong perbaiki bug pada src/services/payment.py"}]
+            }
+            resp = await client.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 200
+        # Seharusnya routing engine jalan dan match backend_core → gemini_tactical
+        routed_rule = resp.headers.get("x-routed-rule", "")
+        routed_model = resp.headers.get("x-routed-model", "")
+        assert routed_rule != "direct_request", f"Routing engine harus aktif, dapat: {routed_rule}"
+        assert routed_model != "ag/claude-sonnet-4-6", f"Harus di-normalize, dapat: {routed_model}"
+
+
+@pytest.mark.asyncio
+async def test_explicit_opus_model_id_gets_normalized(app):
+    """ag/claude-opus-4-6-thinking harus di-normalize ke opus_apex alias."""
+    transport = ASGITransport(app=app)
+    mock_resp = Response(
+        status_code=200,
+        json={
+            "id": "chatcmpl-opus-norm",
+            "object": "chat.completion",
+            "choices": [{"message": {"role": "assistant", "content": "ok"}}],
+            "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+        }
+    )
+    with patch.object(app.state.upstream.client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "model": "ag/claude-opus-4-6-thinking",
+                "messages": [{"role": "user", "content": "Rancang system_architecture baru dan buat schema.prisma"}]
+            }
+            resp = await client.post("/v1/chat/completions", json=payload)
+        assert resp.status_code == 200
+        routed_rule = resp.headers.get("x-routed-rule", "")
+        routed_model = resp.headers.get("x-routed-model", "")
+        assert routed_rule != "direct_request", f"Routing engine harus aktif, dapat: {routed_rule}"
+        assert routed_model != "ag/claude-opus-4-6-thinking", f"Harus di-normalize, dapat: {routed_model}"
+
+
+
+@pytest.mark.asyncio
 async def test_spend_observability_endpoint(app):
     transport = ASGITransport(app=app)
     mock_resp = Response(
