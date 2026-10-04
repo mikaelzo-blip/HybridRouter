@@ -120,6 +120,7 @@ class RequestMetadata(BaseModel):
     session_id: str | None = None
     last_traceback: str | None = None
     last_diff: str | None = None
+    opus_attempts: int = 0
 
 
 class RouteDecision(BaseModel):
@@ -127,4 +128,5 @@ class RouteDecision(BaseModel):
     target_model: str
     pipeline: list[PipelineStep] | None = None
     applied_transforms: list[str] = Field(default_factory=list)
+    transformed_messages: list[dict[str, Any]] | None = None
     escalation_reason: str | None = None

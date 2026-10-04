@@ -82,3 +82,40 @@ def test_live_empty_diff_forces_escalation():
             "metadata": {"session_id": session_id, "last_diff": "", "retry_count": 0}
         })
         assert mock_forward.call_args[0][0] == "gemini_tactical"
+
+
+def test_opus_exhaustion_triggers_human_handoff_423():
+    app = create_app(None)
+    client = TestClient(app)
+
+    session_id = "sess_opus_handoff"
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.content = b'{"choices": [{"message": {"content": "opus response"}}]}'
+    mock_resp.headers = {"content-type": "application/json"}
+
+    with patch.object(app.state.upstream, "forward_request", return_value=(mock_resp, "opus_apex")):
+        # Send 1st failure on opus_apex
+        resp1 = client.post("/v1/chat/completions", json={
+            "model": "opus_apex",
+            "messages": [{"role": "user", "content": "fix complex issue"}],
+            "metadata": {
+                "session_id": session_id,
+                "last_traceback": "Error: attempt 1",
+                "last_diff": "+ patch1"
+            }
+        })
+        assert resp1.status_code == 200
+
+        # Send 2nd failure on opus_apex -> must trigger human_handoff (HTTP 423)
+        resp2 = client.post("/v1/chat/completions", json={
+            "model": "opus_apex",
+            "messages": [{"role": "user", "content": "fix complex issue"}],
+            "metadata": {
+                "session_id": session_id,
+                "last_traceback": "Error: attempt 2",
+                "last_diff": "+ patch2"
+            }
+        })
+        assert resp2.status_code == 423
+        assert resp2.json()["detail"]["error"] == "human_handoff_required"

@@ -61,6 +61,8 @@ def _safe_eval_node(node: ast.AST, env: dict[str, Any]) -> Any:
             return env[node.id]
         raise ValueError(f"Unknown variable in condition: {node.id}")
     elif isinstance(node, ast.Attribute):
+        if node.attr.startswith("__"):
+            raise ValueError(f"Dunder attributes are not allowed: {node.attr}")
         value = _safe_eval_node(node.value, env)
         if hasattr(value, node.attr):
             return getattr(value, node.attr)
@@ -158,13 +160,14 @@ class RouterEngine:
     def route(self, ctx: RoutingContext) -> RouteDecision:
         for rule in self.rules:
             if self._eval_condition(rule.condition, ctx):
-                _, applied = apply_transforms(rule.context_transforms, ctx.messages)
+                transformed_msgs, applied = apply_transforms(rule.context_transforms, ctx.messages)
                 target = rule.target or (rule.pipeline[0].target if rule.pipeline else "gemini_executor")
                 return RouteDecision(
                     rule_name=rule.name,
                     target_model=target,
                     pipeline=rule.pipeline,
                     applied_transforms=applied,
+                    transformed_messages=transformed_msgs if applied else None,
                     escalation_reason=f"Matched rule '{rule.name}' with priority {rule.priority}"
                 )
 
@@ -173,5 +176,6 @@ class RouterEngine:
             rule_name="default_fallback",
             target_model="gemini_executor",
             applied_transforms=[],
+            transformed_messages=None,
             escalation_reason="Default fallback"
         )

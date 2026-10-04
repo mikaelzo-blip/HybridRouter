@@ -29,6 +29,7 @@ class SubtaskCircuitState(BaseModel):
     subtask_id: str
     iterations: int = 0
     start_time: float = Field(default_factory=time.time)
+    last_activity: float = Field(default_factory=time.time)
     consecutive_empty_diffs: int = 0
     diff_hash_history: list[str] = Field(default_factory=list)
     last_normalized_traceback: str | None = None
@@ -57,12 +58,31 @@ class CircuitBreakerTracker:
         self.subtask_start_times: dict[str, float] = {}
 
     def _get_or_create_state(self, subtask_id: str) -> SubtaskCircuitState:
+        now = time.time()
+        # Clean stale sessions if subtasks dict grows large
+        if len(self.subtasks) > 200:
+            stale_keys = [
+                k for k, v in self.subtasks.items()
+                if (now - v.last_activity) > self.max_wall_clock_seconds
+            ]
+            for k in stale_keys:
+                self.subtasks.pop(k, None)
+
         if subtask_id not in self.subtasks:
-            state = SubtaskCircuitState(subtask_id=subtask_id)
+            state = SubtaskCircuitState(subtask_id=subtask_id, start_time=now, last_activity=now)
             if subtask_id in self.subtask_start_times:
                 state.start_time = self.subtask_start_times[subtask_id]
             self.subtasks[subtask_id] = state
-        return self.subtasks[subtask_id]
+        else:
+            state = self.subtasks[subtask_id]
+            # Reset stale session state if idle beyond wall clock timeout
+            if (now - state.last_activity) > self.max_wall_clock_seconds:
+                state = SubtaskCircuitState(subtask_id=subtask_id, start_time=now, last_activity=now)
+                self.subtasks[subtask_id] = state
+            else:
+                state.last_activity = now
+
+        return state
 
     def reset_subtask(self, subtask_id: str) -> None:
         if subtask_id in self.subtasks:
@@ -81,7 +101,7 @@ class CircuitBreakerTracker:
         state.iterations += 1
 
         # 1. Opus exhaustion check
-        if current_tier.lower() == "opus":
+        if current_tier.lower() in ("opus", "opus_apex"):
             state.opus_attempts += 1
             if state.opus_attempts >= self.opus_max_attempts:
                 summary = (

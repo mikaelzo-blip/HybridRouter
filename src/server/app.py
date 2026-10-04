@@ -1,4 +1,6 @@
 from contextlib import asynccontextmanager
+import copy
+import hashlib
 import json
 import logging
 from typing import Any
@@ -123,6 +125,16 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             return spend
         return spend_tracker.get_daily_summary()
 
+    @app.post("/guard/validate_patch")
+    async def validate_patch(request: Request):
+        payload = await request.json()
+        tier = payload.get("tier", "gemini_executor")
+        file_path = payload.get("file_path", "")
+        original_content = payload.get("original_content", "")
+        new_content = payload.get("new_content", "")
+        result = app.state.test_guard.validate_patch(tier, file_path, original_content, new_content)
+        return result.model_dump()
+
     @app.post("/v1/chat/completions")
     async def chat_completions(request: Request):
         body = await request.json()
@@ -130,7 +142,8 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         ctx = extract_routing_context(body)
         metadata = ctx.metadata
         meta_dict = body.get("metadata", {})
-        session_id = meta_dict.get("session_id") or metadata.session_id or metadata.subtask_id or "default"
+        header_sess = request.headers.get("x-session-id")
+        session_id = meta_dict.get("session_id") or metadata.session_id or metadata.subtask_id or header_sess or "default"
         state = app.state.circuit_tracker._get_or_create_state(session_id)
         metadata.opus_attempts = max(metadata.opus_attempts, state.opus_attempts)
 
@@ -151,6 +164,7 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             model_requested = normalized
 
         # Route: "auto", after normalization from raw model ID, or completely unknown model
+        decision = None
         should_route = (model_requested == "auto") or bool(normalized) or (model_requested not in config.models)
         if should_route:
             decision = router_engine.route(ctx)
@@ -161,10 +175,30 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
             # Known alias passed directly — respect it
             target_alias = model_requested
 
-        if target_alias in ("opus_apex", "opus"):
-            state.opus_attempts += 1
+        # Prepare outbound payload: apply transformed messages if produced by router transforms
+        outbound_body = copy.deepcopy(body)
+        if decision and decision.transformed_messages:
+            outbound_body["messages"] = decision.transformed_messages
+
         tb = meta_dict.get("last_traceback") or metadata.last_traceback
         diff = meta_dict.get("last_diff") if "last_diff" in meta_dict else metadata.last_diff
+
+        if diff is not None:
+            # Check for test tampering patterns in diff if touching test files
+            for f in metadata.files_target:
+                if is_test_file(f):
+                    res = app.state.test_guard.validate_patch(
+                        tier=target_alias,
+                        file_path=f,
+                        original_content="",
+                        new_content=diff
+                    )
+                    if not res.approved:
+                        logger.warning("TestIntegrityGuard rejected diff: %s (%s)", res.reason, res.details)
+                        raise HTTPException(
+                            status_code=403,
+                            detail=f"Test integrity violation ({res.reason}): {res.details}"
+                        )
 
         if tb is not None or diff is not None:
             breaker_decision = app.state.circuit_tracker.record_failure(
@@ -173,6 +207,16 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 diff_text=diff,
                 current_tier=target_alias
             )
+            if breaker_decision.action == "human_handoff":
+                logger.error("Human handoff triggered for session %s: %s", session_id, breaker_decision.handoff_summary)
+                raise HTTPException(
+                    status_code=423,
+                    detail={
+                        "error": "human_handoff_required",
+                        "reason": breaker_decision.reason,
+                        "summary": breaker_decision.handoff_summary
+                    }
+                )
             if breaker_decision.action in ("force_escalate_one_tier", "rollback_last_clean_commit_then_escalate_one_tier", "reject_patch_and_escalate"):
                 old_target = target_alias
                 target_alias = TIER_ESCALATION.get(target_alias, target_alias)
@@ -194,25 +238,71 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                         )
                         break
                     else:
-                        logger.warning("Tier 3 attempt to modify test file rejected: %s", f)
-                        raise HTTPException(
-                            status_code=403,
-                            detail=f"Tier 3 ({target_alias}) is prohibited from modifying test files. Escalation required."
-                        )
+                        # Direct request to Tier 3: reject ONLY if this is a modification/write action
+                        last_user_content = ""
+                        for m in reversed(ctx.messages):
+                            if m.get("role") == "user":
+                                c = m.get("content")
+                                if isinstance(c, str):
+                                    last_user_content = c
+                                elif isinstance(c, list):
+                                    last_user_content = " ".join(part.get("text", "") for part in c if isinstance(part, dict))
+                                break
+
+                        mod_keywords = ("update", "edit", "fix", "perbaiki", "ubah", "modify", "write", "tulis", "patch", "refactor", "hapus", "delete", "create", "buat")
+                        is_explicit_target = bool(meta_dict.get("files_target"))
+                        has_mod_intent = any(kw in last_user_content.lower() for kw in mod_keywords) or ("agent_activity_coding" in metadata.intent)
+
+                        if is_explicit_target or has_mod_intent:
+                            logger.warning("Tier 3 attempt to modify test file rejected: %s", f)
+                            raise HTTPException(
+                                status_code=403,
+                                detail=f"Tier 3 ({target_alias}) is prohibited from modifying test files. Escalation required."
+                            )
 
         is_stream = bool(body.get("stream", False))
 
         if is_stream:
             try:
-                stream_gen, final_alias, headers = await upstream.forward_stream(target_alias, body)
+                stream_gen, final_alias, headers = await upstream.forward_stream(target_alias, outbound_body)
+                if final_alias in ("opus_apex", "opus"):
+                    state.opus_attempts += 1
                 resp_headers = {
                     "Content-Type": headers.get("content-type", "text/event-stream"),
                     "x-routed-model": target_alias,
                     "x-routed-final-alias": final_alias,
                     "x-routed-rule": rule_name,
                 }
+
+                subtask_id = metadata.subtask_id or metadata.session_id or "default"
+                async def tracking_stream_generator():
+                    prompt_toks = ctx.total_tokens or (len(str(outbound_body.get("messages", []))) // 4)
+                    completion_chunks_count = 0
+                    usage_captured = False
+                    async for chunk in stream_gen:
+                        if b'"usage"' in chunk:
+                            try:
+                                for line in chunk.split(b"\n"):
+                                    if line.startswith(b"data: ") and not line.startswith(b"data: [DONE]"):
+                                        data = json.loads(line[6:])
+                                        u = data.get("usage")
+                                        if u and (u.get("prompt_tokens") or u.get("completion_tokens")):
+                                            p_tok = u.get("prompt_tokens", 0)
+                                            c_tok = u.get("completion_tokens", 0)
+                                            app.state.spend_tracker.record_usage(subtask_id, p_tok, c_tok, final_alias)
+                                            usage_captured = True
+                                            break
+                            except Exception:
+                                pass
+                        completion_chunks_count += 1
+                        yield chunk
+
+                    if not usage_captured:
+                        est_completion = max(10, completion_chunks_count * 3)
+                        app.state.spend_tracker.record_usage(subtask_id, prompt_toks, est_completion, final_alias)
+
                 return StreamingResponse(
-                    stream_gen,
+                    tracking_stream_generator(),
                     status_code=200,
                     headers=resp_headers
                 )
@@ -221,7 +311,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                 raise HTTPException(status_code=502, detail=f"Upstream provider failure: {str(e)}")
 
         try:
-            resp, final_alias = await upstream.forward_request(target_alias, body)
+            resp, final_alias = await upstream.forward_request(target_alias, outbound_body)
+            if resp.status_code == 200 and final_alias in ("opus_apex", "opus"):
+                state.opus_attempts += 1
         except Exception as e:
             logger.error("Upstream error on alias %s: %s", target_alias, e)
             raise HTTPException(status_code=502, detail=f"Upstream provider failure: {str(e)}")

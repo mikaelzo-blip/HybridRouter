@@ -204,7 +204,7 @@ def test_detect_debugging_activity():
 
 
 def test_detect_code_review_activity():
-    """Hermes doing code review -> activity = code_review."""
+    """diff_review tool → agent_activity_code_review, but quality_gate only with skill loaded."""
     messages = [
         {"role": "system", "content": "You are an AI assistant."},
         {"role": "user", "content": "Review PR ini"},
@@ -226,6 +226,25 @@ def test_detect_code_review_activity():
     ]
     ctx = extract_routing_context({"messages": messages})
     assert "agent_activity_code_review" in ctx.metadata.intent
+    assert "quality_gate" in ctx.metadata.intent  # skill present → final gate
+
+
+def test_detect_code_review_no_skill_no_quality_gate():
+    """diff_review without final-gate skill → agent_activity_code_review only, NOT quality_gate."""
+    messages = [
+        {"role": "system", "content": "You are an AI assistant."},
+        {"role": "user", "content": "Cek perubahannya"},
+        {
+            "role": "assistant",
+            "content": "Running diff review.",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "diff_review", "arguments": '{"diff": "..."}'}},
+            ],
+        },
+    ]
+    ctx = extract_routing_context({"messages": messages})
+    assert "agent_activity_code_review" in ctx.metadata.intent
+    assert "quality_gate" not in ctx.metadata.intent
 
 
 def test_detect_research_activity():

@@ -253,4 +253,53 @@ async def test_spend_anomaly_header_alert(app):
             assert "subtask-large" in resp.headers.get("x-spend-anomaly-reason", "")
 
 
+@pytest.mark.asyncio
+async def test_context_transforms_applied_to_outbound_payload(app):
+    """Ensure context transforms (e.g. system prompt injection / strip noise) reach upstream."""
+    transport = ASGITransport(app=app)
+    mock_resp = Response(
+        status_code=200,
+        json={"choices": [{"message": {"role": "assistant", "content": "Rescued"}}]}
+    )
+    with patch.object(app.state.upstream.client, "post", new_callable=AsyncMock) as mock_post:
+        mock_post.return_value = mock_resp
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            payload = {
+                "model": "auto",
+                "messages": [
+                    {"role": "user", "content": "Help me fix bug\nline 1\nline 2\nline 3"}
+                ],
+                "metadata": {"retry_count": 4, "opus_attempts": 0}
+            }
+            resp = await client.post("/v1/chat/completions", json=payload)
+            assert resp.status_code == 200
+            assert resp.headers["x-routed-rule"] == "rescue_opus"
+
+            # Verify outbound payload received transformed messages
+            called_payload = mock_post.call_args[1]["json"]
+            outbound_msgs = called_payload["messages"]
+            system_msgs = [m for m in outbound_msgs if m.get("role") == "system"]
+            assert len(system_msgs) > 0
+            assert "audit arsitektural" in system_msgs[0]["content"].lower()
+
+
+@pytest.mark.asyncio
+async def test_guard_validate_patch_endpoint(app):
+    """Test /guard/validate_patch endpoint correctly rejects tampering."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Patch skipping pytest
+        payload = {
+            "tier": "gemini_tactical",
+            "file_path": "tests/test_foo.py",
+            "original_content": "def test_ok():\n    assert 1 == 1\n",
+            "new_content": "@pytest.mark.skip(reason='tamper')\ndef test_ok():\n    assert 1 == 1\n"
+        }
+        resp = await client.post("/guard/validate_patch", json=payload)
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["approved"] is False
+        assert data["reason"] == "TEST_TAMPERING_DETECTED"
+
+
 

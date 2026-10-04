@@ -22,11 +22,18 @@ INTENT_PATTERNS = {
     "concurrency_design": re.compile(r"(?i)\b(concurrency[ _\-]design|desain[ _\-]konkurensi|race[ _\-]condition|deadlock|concurrency)\b"),
     "auth_protocol": re.compile(r"(?i)\b(auth[ _\-]protocol|protokol[ _\-]auth|jwt|oauth|auth[ _\-]flow|authentication[ _\-]protocol)\b"),
 }
+# NOTE: quality_gate is intentionally excluded from INTENT_PATTERNS.
+# It must only be set via tool-based detection (_classify_agent_activity):
+# diff_review tool + requesting-code-review skill loaded in the same session.
+# Keyword scanning the full conversation text produces false positives whenever
+# the user writes "quality gate" in plain language (e.g. "masalah quality gate").
 
 TRACEBACK_PATTERN = re.compile(
     r"Traceback \(most recent call last\):.*?(?:\n[a-zA-Z0-9_.]+(?:Error|Exception)?:[^\n]*)",
     re.DOTALL
 )
+READ_ONLY_TOOLS = {"read_file", "search_files", "web_extract", "web_search", "skill_view", "list_dir"}
+
 FAILURE_MARKERS = [
     "Traceback (most recent call last):",
     "FAILED tests/",
@@ -87,7 +94,8 @@ def _extract_skill_arguments(messages: list[dict[str, Any]]) -> list[str]:
             fn = tc.get("function") if isinstance(tc, dict) else None
             if not isinstance(fn, dict) or fn.get("name") != "skill_view":
                 continue
-            args_str = fn.get("arguments", "")
+            args_val = fn.get("arguments")
+            args_str = args_val if isinstance(args_val, str) else ""
             # Quick regex to extract the skill name without json parsing overhead
             name_match = re.search(r'"name"\s*:\s*"([^"]+)"', args_str)
             if name_match:
@@ -122,8 +130,15 @@ def _classify_agent_activity(messages: list[dict[str, Any]]) -> set[str]:
     if tool_set & DELEGATION_TOOLS:
         activities.add("agent_activity_delegation")
 
-    if tool_set & CODE_REVIEW_TOOLS and "agent_activity_code_review" not in activities:
+    if tool_set & CODE_REVIEW_TOOLS:
         activities.add("agent_activity_code_review")
+        # quality_gate only when an explicit final-gate skill was also loaded;
+        # diff_review mid-session (intermediate review) stays on Gemini Tactical.
+        if "agent_activity_code_review" in activities and any(
+            s in ("superpowers:requesting-code-review", "superpowers:receiving-code-review")
+            for s in loaded_skills
+        ):
+            activities.add("quality_gate")
 
     if tool_set & RESEARCH_TOOLS and not activities - {"agent_activity_delegation"}:
         activities.add("agent_activity_research")
@@ -142,9 +157,14 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
     raw_meta: dict[str, Any] = body.get("metadata", {})
     existing_meta = RequestMetadata(**raw_meta)
 
-    # 1. Calculate turn count (number of user messages)
+    # 1. Calculate turn count (number of user messages or agent steps)
     user_turns = sum(1 for m in messages if m.get("role") == "user")
-    turn = max(1, user_turns)
+    assistant_turns = sum(1 for m in messages if m.get("role") == "assistant")
+    if user_turns > 1:
+        turn = user_turns
+    else:
+        turn = max(1, assistant_turns + 1)
+
     if "turn" in raw_meta:
         turn = existing_meta.turn
 
@@ -165,9 +185,21 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
 
     total_tokens = body.get("total_tokens") or getattr(existing_meta, "total_tokens", None) or calculated_tokens
 
-    # 3. Detect files mentioned
+    # 3. Detect files targeted in current turn (last user message)
     detected_files = set(existing_meta.files_target)
-    for chunk in all_content_chunks:
+    last_user_chunks: list[str] = []
+    for m in reversed(messages):
+        if m.get("role") == "user":
+            c = m.get("content")
+            if isinstance(c, str):
+                last_user_chunks.append(c)
+            elif isinstance(c, list):
+                for part in c:
+                    if isinstance(part, dict) and "text" in part:
+                        last_user_chunks.append(part["text"])
+            break
+
+    for chunk in last_user_chunks:
         for match in FILE_PATH_REGEX.findall(chunk):
             cleaned = match.strip().replace("\\", "/")
             # Filter obvious false positives like version numbers 1.0.0
@@ -176,6 +208,8 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
 
     # 4. Detect intents (keyword + agent activity)
     detected_intents = set(existing_meta.intent)
+    if "intents" in raw_meta and isinstance(raw_meta["intents"], list):
+        detected_intents.update(raw_meta["intents"])
     full_text = "\n".join(all_content_chunks)
     for intent_name, pattern in INTENT_PATTERNS.items():
         if pattern.search(full_text):
@@ -190,15 +224,37 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
     if traceback_matches and not last_traceback:
         last_traceback = traceback_matches[-1].strip()
 
-    # Calculate retries by looking for failure signals in user/tool messages
-    error_occurrences = 0
-    for m in messages:
-        if m.get("role") in ("user", "tool"):
-            c = m.get("content", "")
-            if isinstance(c, str) and any(marker in c for marker in FAILURE_MARKERS):
-                error_occurrences += 1
+    # Calculate retries by looking for consecutive failure signals at the tail of conversation
+    consecutive_tail_failures = 0
+    for m in reversed(messages):
+        role = m.get("role")
+        if role not in ("user", "tool"):
+            continue
 
-    retry_count = max(existing_meta.retry_count, error_occurrences)
+        # Read-only inspection tools (read_file, search_files, etc.) return file contents.
+        # Occurrences of "Error:" inside documentation/source files must not be counted as failures.
+        tool_name = m.get("name", "")
+        if role == "tool" and tool_name in READ_ONLY_TOOLS:
+            break
+
+        c = m.get("content", "")
+        text = ""
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = " ".join(part.get("text", "") for part in c if isinstance(part, dict))
+
+        if not text.strip():
+            continue
+
+        has_failure = any(marker in text for marker in FAILURE_MARKERS)
+        if has_failure:
+            consecutive_tail_failures += 1
+        else:
+            # Streak broken by successful tool result or clean message
+            break
+
+    retry_count = existing_meta.retry_count if "retry_count" in raw_meta else consecutive_tail_failures
 
     # Construct unified RequestMetadata
     merged_metadata = RequestMetadata(
@@ -210,6 +266,7 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
         intent=list(detected_intents),
         last_traceback=last_traceback,
         last_diff=existing_meta.last_diff,
+        opus_attempts=existing_meta.opus_attempts,
     )
 
     return RoutingContext(

@@ -41,6 +41,11 @@ class TokenSpendTracker:
         completion_tokens: int,
         model: str,
     ) -> None:
+        if len(self.subtasks) > 1000:
+            # Evict oldest subtasks to prevent unbounded memory growth
+            for k in list(self.subtasks.keys())[:200]:
+                self.subtasks.pop(k, None)
+
         if subtask_id not in self.subtasks:
             self.subtasks[subtask_id] = SubtaskSpend(subtask_id=subtask_id)
 

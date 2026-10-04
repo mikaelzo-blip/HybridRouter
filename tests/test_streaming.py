@@ -222,3 +222,50 @@ async def test_forward_stream_double_close_safe(mock_config):
             collected.append(chunk)
     # Tidak boleh raise RuntimeError
     await upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_forward_stream_uses_model_timeout(mock_config):
+    """Pastikan stream menggunakan timeout_seconds dari config model."""
+    mock_config.models["gemini_executor"].timeout_seconds = 25
+    upstream = UpstreamClient(mock_config)
+
+    mock_resp = MagicMock()
+    mock_resp.status_code = 200
+    mock_resp.headers = {}
+    mock_resp.aiter_bytes = AsyncMock()
+
+    class MockStreamContext:
+        async def __aenter__(self): return mock_resp
+        async def __aexit__(self, *a): pass
+
+    with patch.object(upstream.client, "stream", return_value=MockStreamContext()) as mock_stream:
+        await upstream.forward_stream(
+            "gemini_executor",
+            {"model": "auto", "messages": [{"role": "user", "content": "hi"}], "stream": True}
+        )
+        assert mock_stream.call_args.kwargs.get("timeout") == 25.0
+    await upstream.close()
+
+
+@pytest.mark.asyncio
+async def test_upstream_stream_no_fallback_closed_stream():
+    from src.schemas import FullRouterConfigFile, ProviderConfig, ModelConfig, ResilienceConfig
+    config = FullRouterConfigFile(
+        providers={"antigravity": ProviderConfig(base_url="http://test", api_key="test")},
+        models={"test_model": ModelConfig(provider="antigravity", model="test")},
+        resilience=ResilienceConfig(fallback_chain={})
+    )
+    client = UpstreamClient(config)
+
+    mock_stream_cm = AsyncMock()
+    mock_resp = MagicMock()
+    mock_resp.status_code = 502
+    mock_resp.request = MagicMock()
+    mock_stream_cm.__aenter__.return_value = mock_resp
+
+    client.client.stream = MagicMock(return_value=mock_stream_cm)
+
+    with pytest.raises(httpx.HTTPStatusError):
+        await client.forward_stream("test_model", {"messages": []})
+    await client.close()
