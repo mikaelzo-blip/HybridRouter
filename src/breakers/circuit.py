@@ -5,6 +5,7 @@ import time
 from typing import Literal
 from pydantic import BaseModel, Field
 from src.breakers.normalizer import normalize_traceback
+from src.schemas import CircuitBreakersConfig
 
 
 class BreakerEvent(BaseModel):
@@ -63,8 +64,18 @@ class CircuitBreakerTracker:
         oscillation_window: int = 6,
         opus_max_attempts: int = 2,
         state_file: str | Path | None = None,
-        sticky_turns: int = 5
+        sticky_turns: int = 5,
+        identical_error_action: str = "force_escalate_one_tier",
+        oscillation_action: str = "force_escalate_one_tier",
+        empty_diff_action: str = "rollback_last_clean_commit_then_escalate_one_tier",
+        subtask_limits_action: str = "force_escalate_one_tier",
+        opus_exhausted_action: str = "human_handoff",
     ):
+        self.identical_error_action = identical_error_action
+        self.oscillation_action = oscillation_action
+        self.empty_diff_action = empty_diff_action
+        self.subtask_limits_action = subtask_limits_action
+        self.opus_exhausted_action = opus_exhausted_action
         self.max_iterations = max_iterations
         self.max_wall_clock_seconds = max_wall_clock_minutes * 60
         self.identical_traceback_limit = identical_traceback_limit
@@ -84,6 +95,30 @@ class CircuitBreakerTracker:
                     self.subtasks[sid] = SubtaskCircuitState.model_validate(sdata)
             except Exception:
                 pass
+
+    @classmethod
+    def from_config(
+        cls,
+        cfg: CircuitBreakersConfig,
+        state_file: str | Path | None = None,
+        sticky_turns: int = 5,
+    ) -> "CircuitBreakerTracker":
+        """Build a tracker from the `circuit_breakers:` block of the routing YAML."""
+        return cls(
+            max_iterations=cfg.subtask_limits.max_iterations,
+            max_wall_clock_minutes=cfg.subtask_limits.max_wall_clock_minutes,
+            identical_traceback_limit=cfg.identical_error_loop.consecutive,
+            empty_diff_limit=cfg.empty_diff_guard.consecutive_empty_diffs,
+            oscillation_window=cfg.diff_oscillation.window,
+            opus_max_attempts=cfg.opus_exhausted.max_attempts,
+            state_file=state_file,
+            sticky_turns=sticky_turns,
+            identical_error_action=cfg.identical_error_loop.action,
+            oscillation_action=cfg.diff_oscillation.action,
+            empty_diff_action=cfg.empty_diff_guard.action,
+            subtask_limits_action=cfg.subtask_limits.action,
+            opus_exhausted_action=cfg.opus_exhausted.action,
+        )
 
     def _save_state(self) -> None:
         if not self.state_file:
@@ -200,12 +235,13 @@ class CircuitBreakerTracker:
             state.opus_failures += 1
             if state.opus_failures >= self.opus_max_attempts:
                 summary = (
-                    f"HANDOFF MANUSIA: Subtask '{subtask_id}' gagal 2x berturut-turut pada Tier Opus.\n"
+                    f"HANDOFF MANUSIA: Subtask '{subtask_id}' gagal {state.opus_failures}x pada Tier Opus "
+                    f"(batas {self.opus_max_attempts}x).\n"
                     f"Total iterasi: {state.iterations}.\n"
                     f"Traceback terakhir:\n{(traceback_text or '')[-500:]}"
                 )
                 decision = BreakerDecision(
-                    action="human_handoff",
+                    action=self.opus_exhausted_action,
                     reason="opus_exhausted_2x",
                     opus_attempts=state.opus_failures,
                     handoff_summary=summary
@@ -217,7 +253,7 @@ class CircuitBreakerTracker:
             elapsed = now - state.start_time
             if elapsed >= self.max_wall_clock_seconds:
                 decision = BreakerDecision(
-                    action="force_escalate_one_tier",
+                    action=self.subtask_limits_action,
                     reason="wall_clock_timeout_exceeded",
                     opus_attempts=state.opus_failures
                 )
@@ -225,7 +261,7 @@ class CircuitBreakerTracker:
         # 3. Max iterations check
         if not decision and is_failure and state.iterations >= self.max_iterations:
             decision = BreakerDecision(
-                action="force_escalate_one_tier",
+                action=self.subtask_limits_action,
                 reason="max_iterations_12_exceeded",
                 opus_attempts=state.opus_failures
             )
@@ -237,7 +273,7 @@ class CircuitBreakerTracker:
                 state.consecutive_empty_diffs += 1
                 if state.consecutive_empty_diffs >= self.empty_diff_limit:
                     decision = BreakerDecision(
-                        action="rollback_last_clean_commit_then_escalate_one_tier",
+                        action=self.empty_diff_action,
                         reason="consecutive_empty_diffs_3x",
                         opus_attempts=state.opus_failures
                     )
@@ -250,15 +286,16 @@ class CircuitBreakerTracker:
                 if len(state.diff_hash_history) > self.oscillation_window:
                     state.diff_hash_history.pop(0)
 
-                # Check for oscillation pattern (e.g., A -> B -> A within window)
-                if len(state.diff_hash_history) >= 3:
-                    h = state.diff_hash_history
-                    if h[-1] == h[-3] and h[-1] != h[-2]:
-                        decision = BreakerDecision(
-                            action="force_escalate_one_tier",
-                            reason="diff_oscillation_detected",
-                            opus_attempts=state.opus_failures
-                        )
+                # Oscillation: the current diff already appeared earlier in the window
+                # with something different in between (A-B-A, A-B-C-A, ...). An identical
+                # diff repeated back-to-back (A-A) is not oscillation.
+                h = state.diff_hash_history
+                if len(h) >= 3 and h[-1] != h[-2] and h[-1] in h[:-2]:
+                    decision = BreakerDecision(
+                        action=self.oscillation_action,
+                        reason="diff_oscillation_detected",
+                        opus_attempts=state.opus_failures
+                    )
 
         # 6. Identical error loop breaker (normalized traceback)
         if not decision and traceback_text:
@@ -271,7 +308,7 @@ class CircuitBreakerTracker:
 
             if state.consecutive_identical_tracebacks >= self.identical_traceback_limit:
                 decision = BreakerDecision(
-                    action="force_escalate_one_tier",
+                    action=self.identical_error_action,
                     reason="identical_error_loop_3x",
                     opus_attempts=state.opus_failures
                 )
@@ -280,6 +317,13 @@ class CircuitBreakerTracker:
             decision = BreakerDecision(
                 action="continue",
                 opus_attempts=state.opus_failures
+            )
+        elif decision.action == "human_handoff" and not decision.handoff_summary:
+            # Any breaker can be configured to hand off; always give the human context.
+            decision.handoff_summary = (
+                f"HANDOFF MANUSIA: Subtask '{subtask_id}' dihentikan oleh breaker '{decision.reason}'.\n"
+                f"Total iterasi: {state.iterations}.\n"
+                f"Traceback terakhir:\n{(traceback_text or '')[-500:]}"
             )
 
         self._save_state()

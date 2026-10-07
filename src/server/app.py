@@ -44,7 +44,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app = FastAPI(title="Hybrid Autorouter 3-Tier", version=config.version, lifespan=lifespan)
     app.state.upstream = upstream
     app.state.router_engine = router_engine
-    app.state.circuit_tracker = CircuitBreakerTracker(state_file=app_settings.circuit_state_file)
+    app.state.circuit_tracker = CircuitBreakerTracker.from_config(
+        config.circuit_breakers, state_file=app_settings.circuit_state_file
+    )
     app.state.test_guard = TestIntegrityGuard()
     app.state.spend_tracker = TokenSpendTracker(state_file=app_settings.spend_state_file)
 

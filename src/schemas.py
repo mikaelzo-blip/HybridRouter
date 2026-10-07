@@ -60,35 +60,48 @@ class RouterConfig(BaseModel):
     rules: list[RouterRule] = Field(default_factory=list)
 
 
+# Actions the proxy knows how to carry out when a breaker trips.
+# "rollback_last_clean_commit_then_escalate_one_tier" escalates in the proxy; the
+# rollback itself is the client's job (the proxy has no access to the workspace).
+BreakerAction = Literal[
+    "force_escalate_one_tier",
+    "rollback_last_clean_commit_then_escalate_one_tier",
+    "human_handoff",
+]
+
+
 class IdenticalErrorLoopBreaker(BaseModel):
-    signature: str = "normalized_traceback"
-    consecutive: int = 3
-    action: str = "force_escalate_one_tier"
+    signature: Literal["normalized_traceback"] = "normalized_traceback"
+    consecutive: int = Field(default=3, ge=1)
+    action: BreakerAction = "force_escalate_one_tier"
 
 
 class DiffOscillationBreaker(BaseModel):
-    window: int = 6
-    action: str = "force_escalate_one_tier"
+    # A-B-A detection looks back this many diffs (minimum 3 to fit A-B-A).
+    window: int = Field(default=6, ge=3)
+    action: BreakerAction = "force_escalate_one_tier"
 
 
 class EmptyDiffGuard(BaseModel):
-    consecutive_empty_diffs: int = 3
-    action: str = "rollback_last_clean_commit_then_escalate_one_tier"
+    consecutive_empty_diffs: int = Field(default=3, ge=1)
+    action: BreakerAction = "rollback_last_clean_commit_then_escalate_one_tier"
 
 
 class SubtaskLimitsBreaker(BaseModel):
-    max_iterations: int = 12
-    max_wall_clock_minutes: int = 30
-    action: str = "force_escalate_one_tier"
+    max_iterations: int = Field(default=12, ge=1)
+    max_wall_clock_minutes: int = Field(default=30, ge=1)
+    action: BreakerAction = "force_escalate_one_tier"
 
 
 class OpusExhaustedBreaker(BaseModel):
-    max_attempts: int = 2
-    action: str = "human_handoff"
+    max_attempts: int = Field(default=2, ge=1)
+    action: BreakerAction = "human_handoff"
 
 
 class TestTamperingBreaker(BaseModel):
-    action: str = "reject_patch_and_escalate"
+    # Enforced by the test integrity guard (403 once, then escalate). Only this
+    # behaviour is implemented, so other values are rejected at load time.
+    action: Literal["reject_patch_and_escalate"] = "reject_patch_and_escalate"
 
 
 class CircuitBreakersConfig(BaseModel):
