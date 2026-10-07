@@ -7,6 +7,27 @@ from src.schemas import FullRouterConfigFile
 
 logger = logging.getLogger("hybrid_router.upstream")
 
+# Upstream statuses that are worth retrying on the next alias in the fallback chain.
+TRANSIENT_STATUSES = (429, 500, 502, 503, 504)
+
+
+class UpstreamStatusError(httpx.HTTPStatusError):
+    """Upstream answered a streaming request with a non-2xx status.
+
+    Carries the original status and body so the proxy can pass them through
+    instead of wrapping them in a 200 event-stream.
+    """
+
+    def __init__(self, resp: httpx.Response, body: bytes, alias: str):
+        super().__init__(f"Upstream returned {resp.status_code} for alias {alias}", request=resp.request, response=resp)
+        self.status_code = resp.status_code
+        self.body = body
+        try:
+            self.content_type = resp.headers.get("content-type", "application/json")
+        except Exception:
+            self.content_type = "application/json"
+        self.alias = alias
+
 
 class UpstreamClient:
     def __init__(self, config: FullRouterConfigFile):
@@ -56,7 +77,22 @@ class UpstreamClient:
 
         return prepared
 
-    async def forward_request(self, alias: str, payload: dict[str, Any]) -> tuple[httpx.Response, str]:
+    def _next_fallback(self, current: str, visited: set[str], blocked: frozenset[str] | set[str]) -> str | None:
+        """Next alias in the fallback chain, or None if the chain ends, loops, or is blocked."""
+        next_alias = self.fallback_chain.get(current)
+        if next_alias is None:
+            return None
+        if next_alias in visited:
+            logger.error("Circular fallback loop detected (%s -> %s). Aborting fallback.", current, next_alias)
+            return None
+        if next_alias in blocked:
+            logger.warning("Fallback %s -> %s blocked by routing policy. Aborting fallback.", current, next_alias)
+            return None
+        return next_alias
+
+    async def forward_request(
+        self, alias: str, payload: dict[str, Any], blocked_aliases: frozenset[str] = frozenset()
+    ) -> tuple[httpx.Response, str]:
         current_alias = alias
         visited: set[str] = {current_alias}
         headers = {"Content-Type": "application/json"}
@@ -76,25 +112,17 @@ class UpstreamClient:
                 resp = await self.client.post(url, json=outbound_payload, headers=headers, timeout=timeout)
             except Exception as e:
                 logger.warning("Upstream call failed on alias %s: %s", current_alias, e)
-                # Check fallback
-                if current_alias in self.fallback_chain:
-                    next_alias = self.fallback_chain[current_alias]
-                    if next_alias in visited:
-                        logger.error("Circular fallback loop detected (%s -> %s). Aborting fallback.", current_alias, next_alias)
-                        raise
-                    visited.add(next_alias)
-                    logger.info("Executing fallback from %s -> %s", current_alias, next_alias)
-                    current_alias = next_alias
-                    continue
-                raise
+                next_alias = self._next_fallback(current_alias, visited, blocked_aliases)
+                if next_alias is None:
+                    raise
+                visited.add(next_alias)
+                logger.info("Executing fallback from %s -> %s", current_alias, next_alias)
+                current_alias = next_alias
+                continue
 
-            # Check transient statuses: 429, 502, 503, 504
-            if resp.status_code in (429, 502, 503, 504):
-                if current_alias in self.fallback_chain:
-                    next_alias = self.fallback_chain[current_alias]
-                    if next_alias in visited:
-                        logger.error("Circular fallback loop detected on status %d (%s -> %s). Aborting fallback.", resp.status_code, current_alias, next_alias)
-                        return resp, current_alias
+            if resp.status_code in TRANSIENT_STATUSES:
+                next_alias = self._next_fallback(current_alias, visited, blocked_aliases)
+                if next_alias is not None:
                     visited.add(next_alias)
                     logger.warning(
                         "Upstream returned %d for %s. Falling back to %s",
@@ -105,7 +133,9 @@ class UpstreamClient:
 
             return resp, current_alias
 
-    async def forward_stream(self, alias: str, payload: dict[str, Any]) -> tuple[Any, str, dict[str, str]]:
+    async def forward_stream(
+        self, alias: str, payload: dict[str, Any], blocked_aliases: frozenset[str] = frozenset()
+    ) -> tuple[Any, str, dict[str, str]]:
         current_alias = alias
         visited: set[str] = {current_alias}
         headers = {"Content-Type": "application/json"}
@@ -126,39 +156,31 @@ class UpstreamClient:
                 resp = await stream_cm.__aenter__()
             except Exception as e:
                 logger.warning("Upstream stream initiation failed on alias %s: %s", current_alias, e)
-                if current_alias in self.fallback_chain:
-                    next_alias = self.fallback_chain[current_alias]
-                    if next_alias in visited:
-                        logger.error("Circular fallback loop detected during stream init (%s -> %s). Aborting fallback.", current_alias, next_alias)
-                        raise
-                    visited.add(next_alias)
-                    current_alias = next_alias
-                    continue
-                raise
+                next_alias = self._next_fallback(current_alias, visited, blocked_aliases)
+                if next_alias is None:
+                    raise
+                visited.add(next_alias)
+                current_alias = next_alias
+                continue
 
-            if resp.status_code in (429, 502, 503, 504):
+            if resp.status_code >= 400:
+                # Read the error body before closing so it can be passed through to the client.
+                try:
+                    body = await resp.aread()
+                except Exception:
+                    body = b""
                 await stream_cm.__aexit__(None, None, None)
-                if current_alias in self.fallback_chain:
-                    next_alias = self.fallback_chain[current_alias]
-                    if next_alias in visited:
-                        logger.error("Circular fallback loop detected during stream on status %d (%s -> %s). Aborting fallback.", resp.status_code, current_alias, next_alias)
-                        raise httpx.HTTPStatusError(
-                            f"Upstream returned {resp.status_code}",
-                            request=resp.request,
-                            response=resp
+                if resp.status_code in TRANSIENT_STATUSES:
+                    next_alias = self._next_fallback(current_alias, visited, blocked_aliases)
+                    if next_alias is not None:
+                        visited.add(next_alias)
+                        logger.warning(
+                            "Upstream stream returned %d for %s. Falling back to %s",
+                            resp.status_code, current_alias, next_alias
                         )
-                    visited.add(next_alias)
-                    logger.warning(
-                        "Upstream stream returned %d for %s. Falling back to %s",
-                        resp.status_code, current_alias, next_alias
-                    )
-                    current_alias = next_alias
-                    continue
-                raise httpx.HTTPStatusError(
-                    f"Upstream returned {resp.status_code}",
-                    request=resp.request,
-                    response=resp
-                )
+                        current_alias = next_alias
+                        continue
+                raise UpstreamStatusError(resp, body if isinstance(body, bytes) else b"", current_alias)
 
             async def chunk_generator():
                 try:

@@ -36,9 +36,21 @@ class SubtaskCircuitState(BaseModel):
     diff_hash_history: list[str] = Field(default_factory=list)
     last_normalized_traceback: str | None = None
     consecutive_identical_tracebacks: int = 0
+    # Number of upstream calls actually served by Opus (caps the rescue_opus rule).
     opus_attempts: int = 0
+    # Number of failures produced by Opus (drives the human-handoff breaker).
+    # Kept separate from opus_attempts so one Opus call is never counted twice.
+    opus_failures: int = 0
     last_clean_commit: str | None = None
     sticky_left: int = 0
+    # Alias that actually served the previous upstream call for this session.
+    # A failure reported on the next turn was produced by THIS tier, not by the
+    # tier the new request is about to be routed to.
+    last_served_tier: str | None = None
+    # Hashes of diffs already rejected by the test integrity guard, so the same
+    # (already-applied) diff lingering in the conversation tail is rejected once,
+    # not on every retry.
+    rejected_diff_hashes: list[str] = Field(default_factory=list)
 
 
 class CircuitBreakerTracker:
@@ -137,6 +149,25 @@ class CircuitBreakerTracker:
         self._save_state()
         return alias
 
+    def record_served(self, subtask_id: str, alias: str) -> None:
+        """Remember which tier actually answered the last upstream call."""
+        state = self._get_or_create_state(subtask_id)
+        state.last_served_tier = alias
+        if alias in ("opus", "opus_apex"):
+            state.opus_attempts += 1
+        self._save_state()
+
+    def mark_diff_rejected(self, subtask_id: str, diff_hash: str) -> bool:
+        """Record a rejected diff. Returns True the first time this diff is seen."""
+        state = self._get_or_create_state(subtask_id)
+        if diff_hash in state.rejected_diff_hashes:
+            return False
+        state.rejected_diff_hashes.append(diff_hash)
+        if len(state.rejected_diff_hashes) > 20:
+            state.rejected_diff_hashes.pop(0)
+        self._save_state()
+        return True
+
     def reset_subtask(self, subtask_id: str) -> None:
         if subtask_id in self.subtasks:
             del self.subtasks[subtask_id]
@@ -159,10 +190,15 @@ class CircuitBreakerTracker:
 
         decision: BreakerDecision | None = None
 
-        # 1. Opus exhaustion check
-        if is_failure and current_tier.lower() in ("opus", "opus_apex"):
-            state.opus_attempts += 1
-            if state.opus_attempts >= self.opus_max_attempts:
+        # 1. Opus exhaustion check.
+        # Attribute the failure to the tier that produced it (the one that served the
+        # previous turn). The request that first escalates to Opus still carries the
+        # lower tier's traceback, which must not burn an Opus attempt. Without any
+        # served history (fresh session / restart) fall back to the requested tier.
+        failed_tier = (state.last_served_tier or current_tier).lower()
+        if is_failure and failed_tier in ("opus", "opus_apex"):
+            state.opus_failures += 1
+            if state.opus_failures >= self.opus_max_attempts:
                 summary = (
                     f"HANDOFF MANUSIA: Subtask '{subtask_id}' gagal 2x berturut-turut pada Tier Opus.\n"
                     f"Total iterasi: {state.iterations}.\n"
@@ -171,7 +207,7 @@ class CircuitBreakerTracker:
                 decision = BreakerDecision(
                     action="human_handoff",
                     reason="opus_exhausted_2x",
-                    opus_attempts=state.opus_attempts,
+                    opus_attempts=state.opus_failures,
                     handoff_summary=summary
                 )
 
@@ -183,7 +219,7 @@ class CircuitBreakerTracker:
                 decision = BreakerDecision(
                     action="force_escalate_one_tier",
                     reason="wall_clock_timeout_exceeded",
-                    opus_attempts=state.opus_attempts
+                    opus_attempts=state.opus_failures
                 )
 
         # 3. Max iterations check
@@ -191,7 +227,7 @@ class CircuitBreakerTracker:
             decision = BreakerDecision(
                 action="force_escalate_one_tier",
                 reason="max_iterations_12_exceeded",
-                opus_attempts=state.opus_attempts
+                opus_attempts=state.opus_failures
             )
 
         # 4. Empty diff guard check
@@ -203,7 +239,7 @@ class CircuitBreakerTracker:
                     decision = BreakerDecision(
                         action="rollback_last_clean_commit_then_escalate_one_tier",
                         reason="consecutive_empty_diffs_3x",
-                        opus_attempts=state.opus_attempts
+                        opus_attempts=state.opus_failures
                     )
             else:
                 state.consecutive_empty_diffs = 0
@@ -221,7 +257,7 @@ class CircuitBreakerTracker:
                         decision = BreakerDecision(
                             action="force_escalate_one_tier",
                             reason="diff_oscillation_detected",
-                            opus_attempts=state.opus_attempts
+                            opus_attempts=state.opus_failures
                         )
 
         # 6. Identical error loop breaker (normalized traceback)
@@ -237,13 +273,13 @@ class CircuitBreakerTracker:
                 decision = BreakerDecision(
                     action="force_escalate_one_tier",
                     reason="identical_error_loop_3x",
-                    opus_attempts=state.opus_attempts
+                    opus_attempts=state.opus_failures
                 )
 
         if not decision:
             decision = BreakerDecision(
                 action="continue",
-                opus_attempts=state.opus_attempts
+                opus_attempts=state.opus_failures
             )
 
         self._save_state()
