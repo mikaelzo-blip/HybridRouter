@@ -1,7 +1,9 @@
 from collections import defaultdict
 from dataclasses import dataclass, field
+import json
 import logging
 import math
+from pathlib import Path
 from typing import Any
 
 logger = logging.getLogger("hybrid_router.spend")
@@ -25,14 +27,61 @@ class TokenSpendTracker:
         self,
         anomaly_multiplier: float = 3.0,
         baseline_p99_tokens: int = 15000,
+        state_file: str | Path | None = None,
     ):
         self.anomaly_multiplier = anomaly_multiplier
         self.baseline_p99_tokens = baseline_p99_tokens
+        self.state_file = Path(state_file) if state_file else None
         self.subtasks: dict[str, SubtaskSpend] = {}
         self.daily_total_prompt = 0
         self.daily_total_completion = 0
         self.daily_total_calls = 0
         self.daily_model_tokens: dict[str, int] = defaultdict(int)
+
+        if self.state_file and self.state_file.is_file():
+            try:
+                with open(self.state_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self.daily_total_prompt = data.get("daily_total_prompt", 0)
+                self.daily_total_completion = data.get("daily_total_completion", 0)
+                self.daily_total_calls = data.get("daily_total_calls", 0)
+                self.daily_model_tokens = defaultdict(int, data.get("daily_model_tokens", {}))
+                for sid, sdata in data.get("subtasks", {}).items():
+                    self.subtasks[sid] = SubtaskSpend(
+                        subtask_id=sid,
+                        prompt_tokens=sdata.get("prompt_tokens", 0),
+                        completion_tokens=sdata.get("completion_tokens", 0),
+                        call_count=sdata.get("call_count", 0),
+                        model_breakdown=defaultdict(int, sdata.get("model_breakdown", {})),
+                    )
+            except Exception:
+                pass
+
+    def _save_state(self) -> None:
+        if not self.state_file:
+            return
+        try:
+            self.state_file.parent.mkdir(parents=True, exist_ok=True)
+            payload = {
+                "daily_total_prompt": self.daily_total_prompt,
+                "daily_total_completion": self.daily_total_completion,
+                "daily_total_calls": self.daily_total_calls,
+                "daily_model_tokens": dict(self.daily_model_tokens),
+                "subtasks": {
+                    sid: {
+                        "prompt_tokens": st.prompt_tokens,
+                        "completion_tokens": st.completion_tokens,
+                        "call_count": st.call_count,
+                        "model_breakdown": dict(st.model_breakdown),
+                    }
+                    for sid, st in self.subtasks.items()
+                },
+            }
+            with open(self.state_file, "w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except Exception:
+            pass
+
 
     def record_usage(
         self,
@@ -60,6 +109,7 @@ class TokenSpendTracker:
         self.daily_total_completion += completion_tokens
         self.daily_total_calls += 1
         self.daily_model_tokens[model] += prompt_tokens + completion_tokens
+        self._save_state()
 
     def get_subtask_spend(self, subtask_id: str) -> dict[str, Any]:
         st = self.subtasks.get(subtask_id)

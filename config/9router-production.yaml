@@ -26,6 +26,19 @@ models:
     concurrency_limit: 10
     timeout_seconds: 90
 
+  # Last-resort Claude outside the Antigravity quota pool (opus+sonnet AG share one quota)
+  cc_sonnet_5_5:
+    provider: antigravity
+    model: "cc/claude-sonnet-5-5"
+    concurrency_limit: 10
+    timeout_seconds: 90
+
+  cc_sonnet:
+    provider: antigravity
+    model: "cc/claude-sonnet-5"
+    concurrency_limit: 10
+    timeout_seconds: 90
+
   gemini_tactical:
     provider: antigravity
     model: "${GEMINI_3_1_PRO_MODEL_ID}"
@@ -58,6 +71,8 @@ resilience:
     max_attempts: 5
   fallback_chain:
     opus_apex: sonnet_fallback
+    sonnet_fallback: cc_sonnet_5_5
+    cc_sonnet_5_5: cc_sonnet
     gemini_tactical: gemini_executor
     gemini_executor: gemini_tactical
 

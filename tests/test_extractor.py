@@ -447,3 +447,75 @@ def test_integration_coding_routes_to_flash(router_engine):
     ctx = extract_routing_context({"messages": messages})
     decision = router_engine.route(ctx)
     assert decision.target_model == "gemini_executor"
+
+
+def test_extract_last_diff_from_patch_tool():
+    messages = [
+        {"role": "user", "content": "Update config.py"},
+        {
+            "role": "assistant",
+            "content": "Patching file.",
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "patch",
+                        "arguments": '{"path": "config.py", "old_string": "val = 1", "new_string": "val = 2"}',
+                    },
+                }
+            ],
+        },
+        {"role": "tool", "content": "Successfully patched.", "tool_call_id": "tc1", "name": "patch"},
+    ]
+    ctx = extract_routing_context({"messages": messages})
+    assert ctx.metadata.last_diff is not None
+    assert "- val = 1" in ctx.metadata.last_diff
+    assert "+ val = 2" in ctx.metadata.last_diff
+    assert "config.py" in ctx.metadata.last_diff
+
+
+def test_extract_last_diff_from_write_file_tool():
+    messages = [
+        {"role": "user", "content": "Write test"},
+        {
+            "role": "assistant",
+            "content": "Writing file.",
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": '{"path": "tests/test_a.py", "content": "def test_ok(): pass"}',
+                    },
+                }
+            ],
+        },
+    ]
+    ctx = extract_routing_context({"messages": messages})
+    assert ctx.metadata.last_diff is not None
+    assert "def test_ok(): pass" in ctx.metadata.last_diff
+    assert "tests/test_a.py" in ctx.metadata.last_diff
+
+
+def test_extract_last_diff_explicit_metadata_takes_precedence():
+    messages = [
+        {
+            "role": "assistant",
+            "content": "Patching",
+            "tool_calls": [
+                {
+                    "id": "tc1",
+                    "type": "function",
+                    "function": {
+                        "name": "patch",
+                        "arguments": '{"path": "a.py", "old_string": "a", "new_string": "b"}',
+                    },
+                }
+            ],
+        }
+    ]
+    ctx = extract_routing_context({"messages": messages, "metadata": {"last_diff": "custom_diff"}})
+    assert ctx.metadata.last_diff == "custom_diff"
+

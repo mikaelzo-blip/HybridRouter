@@ -11,9 +11,9 @@ echo ===================================================
 
 where uv >nul 2>&1
 if %ERRORLEVEL% equ 0 (
-    uv run uvicorn src.server.app:create_app --factory --port 20250 --host 127.0.0.1 --reload
+    uv run uvicorn src.server.app:create_app --factory --port 20250 --host 127.0.0.1 >> router.log 2>&1
 ) else if exist ".venv\Scripts\uvicorn.exe" (
-    ".venv\Scripts\uvicorn.exe" src.server.app:create_app --factory --port 20250 --host 127.0.0.1 --reload
+    ".venv\Scripts\uvicorn.exe" src.server.app:create_app --factory --port 20250 --host 127.0.0.1 >> router.log 2>&1
 ) else (
     echo [ERROR] Neither 'uv' nor '.venv\Scripts\uvicorn.exe' was found!
     echo Please install dependencies first with 'uv sync'.

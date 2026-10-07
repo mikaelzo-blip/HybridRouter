@@ -1,3 +1,4 @@
+import json
 import re
 from typing import Any
 from src.schemas import RequestMetadata
@@ -109,7 +110,7 @@ def _classify_agent_activity(messages: list[dict[str, Any]]) -> set[str]:
     Returns a set of agent_activity_* intents.
 
     Priority:
-    1. Explicit skill loaded (brainstorming, TDD, debugging, code-review)
+    1. Explicit skill loaded recently (brainstorming, TDD, debugging)
     2. Tool pattern heuristic (delegation, research, coding)
     """
     activities: set[str] = set()
@@ -117,39 +118,108 @@ def _classify_agent_activity(messages: list[dict[str, Any]]) -> set[str]:
     if not tool_names:
         return activities
 
-    # 1. Check loaded skills
-    loaded_skills = _extract_skill_arguments(messages)
-    for skill_name in loaded_skills:
+    # Extract all skills ever loaded (needed for quality_gate)
+    all_loaded_skills = _extract_skill_arguments(messages)
+    
+    # Active tail: only look at the last 10 messages (~5 turns) for current activity
+    recent_messages = messages[-10:]
+    recent_loaded_skills = _extract_skill_arguments(recent_messages)
+    recent_tool_names = _extract_tool_names(recent_messages)
+    recent_tool_set = set(recent_tool_names)
+
+    # 1. Check recently loaded skills
+    for skill_name in recent_loaded_skills:
         activity = SKILL_ACTIVITY_MAP.get(skill_name)
         if activity:
             activities.add(activity)
 
     # 2. Check tool-based signals (only if no skill already classified the activity)
-    tool_set = set(tool_names)
-
-    if tool_set & DELEGATION_TOOLS:
+    if recent_tool_set & DELEGATION_TOOLS:
         activities.add("agent_activity_delegation")
 
-    if tool_set & CODE_REVIEW_TOOLS:
+    if recent_tool_set & CODE_REVIEW_TOOLS:
         activities.add("agent_activity_code_review")
-        # quality_gate only when an explicit final-gate skill was also loaded;
+        # quality_gate only when an explicit final-gate skill was also loaded AT ANY POINT;
         # diff_review mid-session (intermediate review) stays on Gemini Tactical.
         if "agent_activity_code_review" in activities and any(
             s in ("superpowers:requesting-code-review", "superpowers:receiving-code-review")
-            for s in loaded_skills
+            for s in all_loaded_skills
         ):
             activities.add("quality_gate")
 
-    if tool_set & RESEARCH_TOOLS and not activities - {"agent_activity_delegation"}:
+    if recent_tool_set & RESEARCH_TOOLS and not activities - {"agent_activity_delegation"}:
         activities.add("agent_activity_research")
 
-    # Coding heuristic: 3+ coding tools without a higher-level skill
+    # Coding heuristic: 3+ coding tools recently without a higher-level skill
     if not activities:
-        coding_count = sum(1 for t in tool_names if t in CODING_TOOLS)
+        coding_count = sum(1 for t in recent_tool_names if t in CODING_TOOLS)
         if coding_count >= CODING_TOOL_THRESHOLD:
             activities.add("agent_activity_coding")
 
     return activities
+
+
+def _extract_last_diff(messages: list[dict[str, Any]]) -> str | None:
+    """Extract diff from the most recent code-modifying tool call or diff block.
+
+    Inspects the last 6 messages (~3 turns) for:
+    1. assistant tool_calls with 'patch' or 'write_file'
+    2. diff blocks in tool results or user/assistant messages
+    """
+    recent = messages[-6:]
+    for m in reversed(recent):
+        role = m.get("role")
+        if role == "assistant":
+            tool_calls = m.get("tool_calls")
+            if isinstance(tool_calls, list):
+                for tc in reversed(tool_calls):
+                    if not isinstance(tc, dict):
+                        continue
+                    fn = tc.get("function")
+                    if not isinstance(fn, dict):
+                        continue
+                    name = fn.get("name")
+                    args_val = fn.get("arguments")
+                    args_dict: dict[str, Any] = {}
+                    if isinstance(args_val, str):
+                        try:
+                            args_dict = json.loads(args_val)
+                        except Exception:
+                            pass
+                    elif isinstance(args_val, dict):
+                        args_dict = args_val
+
+                    if name == "patch":
+                        path = args_dict.get("path", "")
+                        old_s = args_dict.get("old_string", "")
+                        new_s = args_dict.get("new_string", "")
+                        return f"--- {path}\n+++ {path}\n- {old_s}\n+ {new_s}"
+                    elif name == "write_file":
+                        path = args_dict.get("path", "")
+                        content = args_dict.get("content", "")
+                        return f"--- {path}\n+++ {path}\n+ {content}"
+
+        # Check content for explicit diff text
+        c = m.get("content", "")
+        text = ""
+        if isinstance(c, str):
+            text = c
+        elif isinstance(c, list):
+            text = " ".join(part.get("text", "") for part in c if isinstance(part, dict))
+
+        if "diff --git" in text or ("--- " in text and "+++ " in text):
+            lines = text.splitlines()
+            diff_lines = []
+            capturing = False
+            for line in lines:
+                if line.startswith("diff --git") or line.startswith("--- "):
+                    capturing = True
+                if capturing:
+                    diff_lines.append(line)
+            if diff_lines:
+                return "\n".join(diff_lines)
+
+    return None
 
 
 def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
@@ -257,6 +327,10 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
     retry_count = existing_meta.retry_count if "retry_count" in raw_meta else consecutive_tail_failures
 
     # Construct unified RequestMetadata
+    last_diff = existing_meta.last_diff
+    if last_diff is None and "last_diff" not in raw_meta:
+        last_diff = _extract_last_diff(messages)
+
     merged_metadata = RequestMetadata(
         subtask_id=existing_meta.subtask_id,
         session_id=existing_meta.session_id,
@@ -265,7 +339,7 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
         retry_count=retry_count,
         intent=list(detected_intents),
         last_traceback=last_traceback,
-        last_diff=existing_meta.last_diff,
+        last_diff=last_diff,
         opus_attempts=existing_meta.opus_attempts,
     )
 

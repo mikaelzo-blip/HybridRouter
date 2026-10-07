@@ -53,3 +53,17 @@ def test_daily_summary_aggregation():
     assert summary["total_calls"] == 2
     assert summary["models"]["flash"] == 150
     assert summary["models"]["pro"] == 300
+
+
+def test_spend_persistence(tmp_path):
+    state_file = str(tmp_path / "spend_state.json")
+    tracker1 = TokenSpendTracker(state_file=state_file)
+    tracker1.record_usage("task-p", prompt_tokens=300, completion_tokens=100, model="flash")
+
+    tracker2 = TokenSpendTracker(state_file=state_file)
+    spend = tracker2.get_subtask_spend("task-p")
+    assert spend["total_tokens"] == 400
+    assert spend["call_count"] == 1
+    assert spend["model_breakdown"]["flash"] == 400
+    assert tracker2.daily_total_prompt == 300
+

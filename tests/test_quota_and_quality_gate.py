@@ -175,3 +175,17 @@ def test_server_enforces_opus_attempt_limit_across_requests():
         assert r3.status_code == 200
         assert r3.headers["x-routed-model"] == "gemini_tactical"
 
+
+def test_opus_fallback_chain_escapes_antigravity_claude_pool():
+    """AG Claude quota is shared by opus+sonnet; chain must end on a non-AG-Claude model."""
+    cfg = load_router_config("config/9router-production.yaml")
+    chain = cfg.resilience.fallback_chain
+    seen, cur = [], "opus_apex"
+    while cur in chain and cur not in seen:
+        seen.append(cur)
+        cur = chain[cur]
+    seen.append(cur)
+    assert seen[:4] == ["opus_apex", "sonnet_fallback", "cc_sonnet_5_5", "cc_sonnet"]
+    assert cfg.models[cur].model.startswith("cc/") or "gemini" in cfg.models[cur].model
+    assert cur not in ("opus_apex", "sonnet_fallback")
+

@@ -41,9 +41,9 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
     app = FastAPI(title="Hybrid Autorouter 3-Tier", version=config.version, lifespan=lifespan)
     app.state.upstream = upstream
     app.state.router_engine = router_engine
-    app.state.circuit_tracker = CircuitBreakerTracker()
+    app.state.circuit_tracker = CircuitBreakerTracker(state_file=app_settings.circuit_state_file)
     app.state.test_guard = TestIntegrityGuard()
-    app.state.spend_tracker = TokenSpendTracker()
+    app.state.spend_tracker = TokenSpendTracker(state_file=app_settings.spend_state_file)
 
     @app.get("/health")
     async def health():
@@ -224,6 +224,14 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     "Circuit breaker triggered (%s) for session %s. Escalated %s -> %s",
                     breaker_decision.reason, session_id, old_target, target_alias
                 )
+        if decision is not None:
+            sticky_alias = app.state.circuit_tracker.apply_sticky(session_id, target_alias)
+            if sticky_alias != target_alias:
+                logger.info("Sticky tier: %s -> %s for session %s", target_alias, sticky_alias, session_id)
+                target_alias = sticky_alias
+
+        if not tb and (diff is None or diff.strip()) and metadata.retry_count == 0:
+            app.state.circuit_tracker.record_success(subtask_id=session_id)
 
         # Check test integrity guard for Tier 3
         if target_alias in ("gemini_executor", "flash"):

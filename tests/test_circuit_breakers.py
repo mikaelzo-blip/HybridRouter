@@ -122,3 +122,95 @@ def test_opus_exhaustion_human_handoff():
     assert dec2.action == "human_handoff"
     assert dec2.reason == "opus_exhausted_2x"
     assert dec2.handoff_summary is not None
+
+
+def test_circuit_breaker_persistence(tmp_path):
+    state_file = str(tmp_path / "breaker_state.json")
+    tracker1 = CircuitBreakerTracker(state_file=state_file)
+    subtask_id = "persist_task"
+
+    tb = "Traceback (most recent call last):\n  File 'x.py', line 1\nRuntimeError: test"
+    tracker1.record_failure(subtask_id=subtask_id, traceback_text=tb, diff_text="+ x", current_tier="flash")
+    tracker1.record_failure(subtask_id=subtask_id, traceback_text=tb, diff_text="+ x2", current_tier="flash")
+
+    # Verify tracker2 reloads state from disk
+    tracker2 = CircuitBreakerTracker(state_file=state_file)
+    state = tracker2.subtasks[subtask_id]
+    assert state.consecutive_identical_tracebacks == 2
+    assert state.iterations == 2
+
+    # 3rd failure on reloaded instance triggers identical_error_loop_3x
+    dec = tracker2.record_failure(subtask_id=subtask_id, traceback_text=tb, diff_text="+ x3", current_tier="flash")
+    assert dec.action == "force_escalate_one_tier"
+    assert dec.reason == "identical_error_loop_3x"
+
+
+def test_circuit_breaker_record_success_resets_streaks():
+    tracker = CircuitBreakerTracker()
+    subtask_id = "success_task"
+
+    tb = "Traceback (most recent call last):\n  File 'x.py', line 1\nRuntimeError: test"
+    tracker.record_failure(subtask_id=subtask_id, traceback_text=tb, diff_text="", current_tier="flash")
+    tracker.record_failure(subtask_id=subtask_id, traceback_text=tb, diff_text="", current_tier="flash")
+
+    state = tracker.subtasks[subtask_id]
+    assert state.consecutive_identical_tracebacks == 2
+    assert state.consecutive_empty_diffs == 2
+
+    # Success occurs (clean test pass)
+    tracker.record_success(subtask_id=subtask_id)
+
+    assert state.consecutive_identical_tracebacks == 0
+    assert state.consecutive_empty_diffs == 0
+    assert state.last_normalized_traceback is None
+    # Success clears the failure budget and wall-clock window
+    assert state.iterations == 0
+
+
+def test_success_resets_iterations_and_wall_clock():
+    tracker = CircuitBreakerTracker()
+    sid = "long_session"
+    state = tracker._get_or_create_state(sid)
+    state.start_time = time.time() - 31 * 60
+    state.iterations = 11
+    tracker.record_success(subtask_id=sid)
+    assert state.iterations == 0
+    assert time.time() - state.start_time < 5
+    tb = "Traceback (most recent call last):\nValueError: x"
+    dec = tracker.record_failure(sid, traceback_text=tb, current_tier="flash")
+    assert dec.action == "continue"
+
+
+def test_clean_diff_without_traceback_is_not_a_failure():
+    """Normal patch/write_file edits must not burn iterations or trip the wall clock."""
+    tracker = CircuitBreakerTracker()
+    sid = "editing_session"
+    state = tracker._get_or_create_state(sid)
+    state.start_time = time.time() - 31 * 60
+    for i in range(20):
+        diff = "--- a\n+++ a\n+ edit %d" % i
+        dec = tracker.record_failure(sid, traceback_text=None, diff_text=diff, current_tier="flash")
+        assert dec.action == "continue", (i, dec.reason)
+    assert state.iterations == 0
+
+
+def test_sticky_tier_prevents_downgrade_flapping():
+    tracker = CircuitBreakerTracker(sticky_turns=3)
+    sid = "sticky"
+    assert tracker.apply_sticky(sid, "gemini_tactical") == "gemini_tactical"
+    # next turns routed to flash stay on tactical for sticky_turns, then drop
+    assert [tracker.apply_sticky(sid, "gemini_executor") for _ in range(4)] == [
+        "gemini_tactical", "gemini_tactical", "gemini_tactical", "gemini_executor"
+    ]
+
+
+def test_sticky_tier_caps_at_tactical_and_ignores_other_aliases():
+    tracker = CircuitBreakerTracker(sticky_turns=3)
+    sid = "sticky2"
+    # Opus rescue must not pin the session to Opus (burns Claude quota)
+    assert tracker.apply_sticky(sid, "opus_apex") == "opus_apex"
+    assert tracker.apply_sticky(sid, "gemini_executor") == "gemini_tactical"
+    # non-ladder alias (review target) passes through untouched
+    assert tracker.apply_sticky(sid, "sonnet_fallback") == "sonnet_fallback"
+    # sessions are independent
+    assert tracker.apply_sticky("other", "gemini_executor") == "gemini_executor"

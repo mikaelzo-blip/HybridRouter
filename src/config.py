@@ -65,3 +65,5 @@ class AppSettings(BaseSettings):
     upstream_base_url: str = Field(default="http://127.0.0.1:20128/v1", alias="UPSTREAM_BASE_URL")
     routing_config_path: str = Field(default="config/9router-production.yaml", alias="ROUTING_CONFIG_PATH")
     log_level: str = Field(default="info", alias="LOG_LEVEL")
+    circuit_state_file: str | None = Field(default=None, alias="CIRCUIT_STATE_FILE")
+    spend_state_file: str | None = Field(default=None, alias="SPEND_STATE_FILE")
