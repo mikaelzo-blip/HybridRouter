@@ -159,6 +159,32 @@ def _classify_agent_activity(messages: list[dict[str, Any]]) -> set[str]:
     return activities
 
 
+def _tail_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Messages after the last assistant turn: the newest user input / tool results.
+
+    This is the only part of the conversation that describes the *current* state.
+    Anything earlier (e.g. a traceback that has since been fixed) is history.
+    """
+    for i in range(len(messages) - 1, -1, -1):
+        if messages[i].get("role") == "assistant":
+            return messages[i + 1:]
+    return messages
+
+
+def _message_text(m: dict[str, Any]) -> str:
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return "\n".join(part.get("text", "") for part in c if isinstance(part, dict))
+    return ""
+
+
+def _prefix_lines(prefix: str, text: str) -> str:
+    lines = str(text).splitlines() or [""]
+    return "\n".join(f"{prefix} {line}" for line in lines)
+
+
 def _extract_last_diff(messages: list[dict[str, Any]]) -> str | None:
     """Extract diff from the most recent code-modifying tool call or diff block.
 
@@ -193,11 +219,12 @@ def _extract_last_diff(messages: list[dict[str, Any]]) -> str | None:
                         path = args_dict.get("path", "")
                         old_s = args_dict.get("old_string", "")
                         new_s = args_dict.get("new_string", "")
-                        return f"--- {path}\n+++ {path}\n- {old_s}\n+ {new_s}"
+                        # Prefix every line so multi-line edits can be inspected line by line.
+                        return f"--- {path}\n+++ {path}\n{_prefix_lines('-', old_s)}\n{_prefix_lines('+', new_s)}"
                     elif name == "write_file":
                         path = args_dict.get("path", "")
                         content = args_dict.get("content", "")
-                        return f"--- {path}\n+++ {path}\n+ {content}"
+                        return f"--- {path}\n+++ {path}\n{_prefix_lines('+', content)}"
 
         # Check content for explicit diff text
         c = m.get("content", "")
@@ -289,8 +316,12 @@ def extract_routing_context(body: dict[str, Any]) -> RoutingContext:
     detected_intents |= _classify_agent_activity(messages)
 
     # 5. Extract traceback and retry count
+    # Only the conversation tail counts: a traceback buried in history has usually
+    # been fixed already, and re-reporting it every turn kept the identical-error
+    # breaker firing forever and prevented record_success from ever running.
     last_traceback = existing_meta.last_traceback
-    traceback_matches = TRACEBACK_PATTERN.findall(full_text)
+    tail_text = "\n".join(_message_text(m) for m in _tail_messages(messages))
+    traceback_matches = TRACEBACK_PATTERN.findall(tail_text)
     if traceback_matches and not last_traceback:
         last_traceback = traceback_matches[-1].strip()
 

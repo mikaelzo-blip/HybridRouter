@@ -10,7 +10,8 @@ from src.config import AppSettings, load_router_config
 from src.router.engine import RouterEngine, RoutingContext
 from src.router.extractor import extract_routing_context
 from src.schemas import RequestMetadata
-from src.server.upstream import UpstreamClient
+from src.server.upstream import UpstreamClient, UpstreamStatusError
+from src.router.transforms import inject_system_prompt
 from src.breakers.circuit import CircuitBreakerTracker
 from src.guard.test_integrity import TestIntegrityGuard, is_test_file
 from src.observability.spend import TokenSpendTracker
@@ -25,6 +26,8 @@ TIER_ESCALATION = {
     "opus_apex": "sonnet_fallback",
     "opus": "sonnet_fallback",
 }
+
+TIER3_ALIASES = frozenset({"gemini_executor", "flash"})
 
 
 def create_app(settings: AppSettings | None = None) -> FastAPI:
@@ -183,22 +186,32 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
         tb = meta_dict.get("last_traceback") or metadata.last_traceback
         diff = meta_dict.get("last_diff") if "last_diff" in meta_dict else metadata.last_diff
 
-        if diff is not None:
-            # Check for test tampering patterns in diff if touching test files
-            for f in metadata.files_target:
-                if is_test_file(f):
-                    res = app.state.test_guard.validate_patch(
-                        tier=target_alias,
-                        file_path=f,
-                        original_content="",
-                        new_content=diff
+        guard_note: str | None = None
+        if diff:
+            # Inspect only the lines the diff adds to test files (removing a skip is fine).
+            res = app.state.test_guard.validate_diff(diff, fallback_paths=metadata.files_target)
+            if not res.approved:
+                diff_hash = hashlib.sha256(diff.encode("utf-8")).hexdigest()[:16]
+                if app.state.circuit_tracker.mark_diff_rejected(session_id, diff_hash):
+                    # First sighting: reject the patch.
+                    logger.warning("TestIntegrityGuard rejected diff: %s (%s)", res.reason, res.details)
+                    raise HTTPException(
+                        status_code=403,
+                        detail=f"Test integrity violation ({res.reason}): {res.details}"
                     )
-                    if not res.approved:
-                        logger.warning("TestIntegrityGuard rejected diff: %s (%s)", res.reason, res.details)
-                        raise HTTPException(
-                            status_code=403,
-                            detail=f"Test integrity violation ({res.reason}): {res.details}"
-                        )
+                # The same (already applied) diff is still in the conversation tail.
+                # Rejecting again would deadlock the agent, so escalate one tier and tell
+                # the model to revert it instead.
+                old_target = target_alias
+                target_alias = TIER_ESCALATION.get(target_alias, target_alias)
+                guard_note = (
+                    f"PERINGATAN Test Integrity Guard: patch terakhir ditolak ({res.reason}: {res.details}). "
+                    "Kembalikan perubahan tersebut. Jangan melewati, menonaktifkan, atau mengurangi assertion pada test."
+                )
+                logger.warning(
+                    "Rejected diff still present for session %s. Escalated %s -> %s and injected revert notice.",
+                    session_id, old_target, target_alias
+                )
 
         if tb is not None or diff is not None:
             breaker_decision = app.state.circuit_tracker.record_failure(
@@ -268,13 +281,22 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                                 detail=f"Tier 3 ({target_alias}) is prohibited from modifying test files. Escalation required."
                             )
 
+        if guard_note:
+            outbound_body["messages"] = inject_system_prompt(outbound_body.get("messages", []), guard_note)
+
+        # Requests touching test files must never fall back into Tier 3 (read-only for tests).
+        blocked_aliases: frozenset[str] = frozenset()
+        if target_alias not in TIER3_ALIASES and any(is_test_file(f) for f in metadata.files_target):
+            blocked_aliases = TIER3_ALIASES
+
         is_stream = bool(body.get("stream", False))
 
         if is_stream:
             try:
-                stream_gen, final_alias, headers = await upstream.forward_stream(target_alias, outbound_body)
-                if final_alias in ("opus_apex", "opus"):
-                    state.opus_attempts += 1
+                stream_gen, final_alias, headers = await upstream.forward_stream(
+                    target_alias, outbound_body, blocked_aliases=blocked_aliases
+                )
+                app.state.circuit_tracker.record_served(session_id, final_alias)
                 resp_headers = {
                     "Content-Type": headers.get("content-type", "text/event-stream"),
                     "x-routed-model": target_alias,
@@ -314,14 +336,29 @@ def create_app(settings: AppSettings | None = None) -> FastAPI:
                     status_code=200,
                     headers=resp_headers
                 )
+            except UpstreamStatusError as e:
+                # Pass the upstream error through with its real status instead of a 200 stream.
+                logger.error("Upstream stream returned %d on alias %s", e.status_code, e.alias)
+                return Response(
+                    content=e.body,
+                    status_code=e.status_code,
+                    headers={
+                        "Content-Type": e.content_type,
+                        "x-routed-model": target_alias,
+                        "x-routed-final-alias": e.alias,
+                        "x-routed-rule": rule_name,
+                    },
+                )
             except Exception as e:
                 logger.error("Upstream stream error on alias %s: %s", target_alias, e)
                 raise HTTPException(status_code=502, detail=f"Upstream provider failure: {str(e)}")
 
         try:
-            resp, final_alias = await upstream.forward_request(target_alias, outbound_body)
-            if resp.status_code == 200 and final_alias in ("opus_apex", "opus"):
-                state.opus_attempts += 1
+            resp, final_alias = await upstream.forward_request(
+                target_alias, outbound_body, blocked_aliases=blocked_aliases
+            )
+            if resp.status_code == 200:
+                app.state.circuit_tracker.record_served(session_id, final_alias)
         except Exception as e:
             logger.error("Upstream error on alias %s: %s", target_alias, e)
             raise HTTPException(status_code=502, detail=f"Upstream provider failure: {str(e)}")

@@ -58,7 +58,92 @@ def count_python_assertions(code: str) -> int:
         return len(re.findall(r"\bassert\b", code))
 
 
+_DIFF_PATH_HEADER = re.compile(r"^(?:\+\+\+|---)\s+(?:[ab]/)?(\S.*?)\s*$")
+_GIT_DIFF_HEADER = re.compile(r"^diff --git a/(\S+) b/(\S+)")
+
+
+def split_diff_by_file(diff_text: str) -> list[tuple[str | None, list[str], list[str]]]:
+    """Split a unified-ish diff into (path, added_lines, removed_lines) per file.
+
+    A diff without any file header yields a single section with path None.
+    """
+    sections: list[tuple[str | None, list[str], list[str]]] = []
+    path: str | None = None
+    added: list[str] = []
+    removed: list[str] = []
+    started = False
+
+    def flush() -> None:
+        if started or added or removed:
+            sections.append((path, added, removed))
+
+    for line in diff_text.splitlines():
+        git_m = _GIT_DIFF_HEADER.match(line)
+        if git_m:
+            flush()
+            path, added, removed, started = git_m.group(2), [], [], True
+            continue
+        if line.startswith("--- "):
+            hdr = _DIFF_PATH_HEADER.match(line)
+            new_path = hdr.group(1) if hdr else None
+            # "--- path" opens a new file section unless it follows a `diff --git` header
+            if not (started and not added and not removed and path is not None):
+                flush()
+                added, removed = [], []
+            path = None if new_path == "/dev/null" else new_path
+            started = True
+            continue
+        if line.startswith("+++ "):
+            hdr = _DIFF_PATH_HEADER.match(line)
+            if hdr and hdr.group(1) != "/dev/null":
+                path = hdr.group(1)
+            continue
+        if line.startswith("+"):
+            added.append(line[1:])
+        elif line.startswith("-"):
+            removed.append(line[1:])
+    flush()
+    return sections
+
+
 class TestIntegrityGuard:
+    def validate_diff(self, diff_text: str, fallback_paths: list[str] | None = None) -> PatchValidationResult:
+        """Inspect an (already produced) diff for test tampering, regardless of tier.
+
+        Only lines the diff ADDS are suspect: removing a `@pytest.mark.skip` is a fix,
+        not tampering. Sections whose file is not a test file are ignored. Diffs with
+        no file header are attributed to `fallback_paths` (e.g. request files_target).
+        """
+        for path, added, removed in split_diff_by_file(diff_text):
+            paths = [path] if path else list(fallback_paths or [])
+            test_paths = [p for p in paths if is_test_file(p)]
+            if not test_paths:
+                continue
+            target = test_paths[0]
+            added_text = "\n".join(added)
+            removed_text = "\n".join(removed)
+
+            for pat in PROHIBITED_TEST_TAMPERING_PATTERNS:
+                m = pat.search(added_text)
+                if m and not pat.search(removed_text):
+                    return PatchValidationResult(
+                        approved=False,
+                        reason="TEST_TAMPERING_DETECTED",
+                        details=f"Detected tampering token '{m.group(0)}' in '{target}'"
+                    )
+
+            if target.endswith(".py"):
+                removed_asserts = len(re.findall(r"\bassert\b", removed_text))
+                added_asserts = len(re.findall(r"\bassert\b", added_text))
+                if added_asserts < removed_asserts:
+                    return PatchValidationResult(
+                        approved=False,
+                        reason="ASSERTION_COUNT_REDUCED",
+                        details=f"Assertion count reduced by {removed_asserts - added_asserts} in '{target}'"
+                    )
+
+        return PatchValidationResult(approved=True)
+
     def validate_patch(
         self,
         tier: str,
